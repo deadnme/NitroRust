@@ -8,6 +8,8 @@ pub struct Acer {
     path: String,
     // Class definition, fetched once: GetMethod on it is local, so each call costs one round trip.
     class: IWbemClassWrapper,
+    /// What this laptop has; set from the probe right after open(). Defaults = AN515-45.
+    pub caps: Option<crate::caps::Caps>,
 }
 
 #[derive(serde::Deserialize)]
@@ -36,7 +38,46 @@ impl Acer {
             .ok_or_else(|| WMIError::ResultEmpty)?
             .__Path;
         let class = wmi.get_object("AcerGamingFunction")?;
-        Ok(Self { wmi, path, class })
+        Ok(Self { wmi, path, class, caps: None })
+    }
+
+    /// Read-only questions about what the firmware supports. Never changes anything.
+    pub fn probe(&self) -> crate::caps::Probe {
+        let get = |m: &str, v: u32| self.get(m, v).ok();
+        crate::caps::Probe {
+            sys_info: get("GetGamingSysInfo", 0x0000),
+            fan_behavior: get("GetGamingFanBehavior", 0x1),
+            kb_backlight: self.kb_backlight_state().ok(),
+            rgb_zone: get("GetGamingRgbKb", 0x1),
+            misc_profiles: get("GetGamingMiscSetting", 0x0A),
+        }
+    }
+
+    /// GetGamingKBBacklight: (gmReturn, gmOutput bytes). It takes no input.
+    fn kb_backlight_state(&self) -> R<(u8, Vec<u8>)> {
+        let out = self.wmi.exec_method(&self.path, "GetGamingKBBacklight", None)?.ok_or(WMIError::ResultEmpty)?;
+        let ret = match out.get_property("gmReturn")? {
+            Variant::UI1(v) => v,
+            Variant::I4(v) => v as u8,
+            _ => 0xFF,
+        };
+        let bytes = match out.get_property("gmOutput")? {
+            Variant::Array(a) => a
+                .into_iter()
+                .map(|v| match v {
+                    Variant::UI1(b) => b,
+                    Variant::I4(b) => b as u8,
+                    _ => 0,
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        Ok((ret, bytes))
+    }
+
+    /// (cpu fan, gpu fan) the firmware is told about.
+    fn fans(&self) -> (bool, bool) {
+        self.caps.as_ref().map_or((true, true), |c| (c.cpu_fan, c.gpu_fan))
     }
 
     /// Runs one gaming method. `input` goes in as gmInput; gmOutput comes back as a number.
@@ -70,41 +111,49 @@ impl Acer {
         self.call(method, Variant::UI4(input))
     }
 
+    /// Reads one sensor if this laptop has it; 0 otherwise.
+    fn sensor(&self, has: bool, addr: u32) -> u64 {
+        // Bits 0-7 are a status: anything but 0 is an error reply, not a reading.
+        if has { self.get("GetGamingSysInfo", addr).ok().filter(|v| v & 0xFF == 0).unwrap_or(0) } else { 0 }
+    }
+
     pub fn telemetry(&self) -> Telemetry {
-        let read = |addr| self.get("GetGamingSysInfo", addr).unwrap_or(0);
+        let c = self.caps.clone().unwrap_or_else(|| crate::caps::Caps::from_probe("", &Default::default(), false));
         Telemetry {
-            cpu_temp: sensor_temp(read(SENSOR_CPU_TEMP)),
-            gpu_temp: sensor_temp(read(SENSOR_GPU_TEMP)),
-            cpu_rpm: sensor_rpm(read(SENSOR_CPU_RPM)),
-            gpu_rpm: sensor_rpm(read(SENSOR_GPU_RPM)),
+            cpu_temp: sensor_temp(self.sensor(c.cpu_temp, SENSOR_CPU_TEMP)),
+            gpu_temp: sensor_temp(self.sensor(c.gpu_temp, SENSOR_GPU_TEMP)),
+            cpu_rpm: sensor_rpm(self.sensor(c.cpu_rpm, SENSOR_CPU_RPM)),
+            gpu_rpm: sensor_rpm(self.sensor(c.gpu_rpm, SENSOR_GPU_RPM)),
         }
     }
 
     /// Temperatures only: what the fan curve needs while the window is hidden (2 calls, not 4).
     pub fn temps(&self) -> Telemetry {
-        let read = |addr| self.get("GetGamingSysInfo", addr).unwrap_or(0);
+        let (cpu, gpu) = self.caps.as_ref().map_or((true, true), |c| (c.cpu_temp, c.gpu_temp));
         Telemetry {
-            cpu_temp: sensor_temp(read(SENSOR_CPU_TEMP)),
-            gpu_temp: sensor_temp(read(SENSOR_GPU_TEMP)),
+            cpu_temp: sensor_temp(self.sensor(cpu, SENSOR_CPU_TEMP)),
+            gpu_temp: sensor_temp(self.sensor(gpu, SENSOR_GPU_TEMP)),
             ..Default::default()
         }
     }
 
     pub fn fans_auto(&self) -> R<bool> {
-        self.set("SetGamingFanBehavior", FAN_AUTO)
+        let (c, g) = self.fans();
+        self.set("SetGamingFanBehavior", fan_behavior(c, g, MODE_AUTO))
     }
 
     pub fn fans_max(&self) -> R<bool> {
-        self.set("SetGamingFanBehavior", FAN_MAX)
+        let (c, g) = self.fans();
+        self.set("SetGamingFanBehavior", fan_behavior(c, g, MODE_MAX))
     }
 
     pub fn fans_custom(&self, cpu: u8, gpu: u8) -> R<bool> {
-        if !self.set("SetGamingFanBehavior", FAN_CUSTOM)? {
+        let (has_cpu, has_gpu) = self.fans();
+        if !self.set("SetGamingFanBehavior", fan_behavior(has_cpu, has_gpu, MODE_CUSTOM))? {
             return Ok(false);
         }
-        let speeds = self
-            .set("SetGamingFanSpeed", fan_speed(FAN_CPU, cpu))
-            .and_then(|a| Ok(a & self.set("SetGamingFanSpeed", fan_speed(FAN_GPU, gpu))?));
+        let speed = |has: bool, id, pct| if has { self.set("SetGamingFanSpeed", fan_speed(id, pct)) } else { Ok(true) };
+        let speeds = speed(has_cpu, FAN_CPU, cpu).and_then(|a| Ok(a & speed(has_gpu, FAN_GPU, gpu)?));
         if !matches!(speeds, Ok(true)) {
             // Never leave the fans in custom mode at an unknown speed.
             let _ = self.fans_auto();

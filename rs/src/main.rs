@@ -1,4 +1,4 @@
-//! NitroSense replacement for the Acer Nitro AN515-45: fans (modes and software curves), power plan,
+//! NitroSense replacement for Acer Nitro laptops (verified: AN515-45): fans (modes and software curves), power plan,
 //! temperatures and keyboard lighting in a Slint window that lives in the tray.
 //! The simple view covers everyday use; the "Advanced" switch shows fixed speeds, the curve editor,
 //! fan RPM, keyboard effects and per-zone colours.
@@ -9,11 +9,13 @@
 #![windows_subsystem = "windows"]
 
 mod acer;
+mod caps;
 mod curve;
 mod power;
 mod proto;
 mod settings;
 
+use caps::{Caps, Probe};
 use curve::Curve;
 use settings::Settings;
 use slint::{CloseRequestResponse, Color, ComponentHandle, ModelRc, SharedString, Timer, TimerMode, VecModel};
@@ -132,20 +134,32 @@ const CURVE_PERIOD: Duration = Duration::from_secs(2);
 struct Hw(std::sync::mpsc::Sender<Msg>);
 
 impl Hw {
-    /// Opens the connection; also returns the keyboard's current zone colours.
-    fn open() -> Result<(Hw, [[u8; 3]; 4]), String> {
+    /// Opens the connection and asks the firmware what it supports (read-only).
+    /// Also returns the keyboard's current zone colours.
+    /// `ui` hears about a curve the firmware keeps refusing (tray action "curve-refused").
+    fn open(model: String, pretend_unverified: bool, ui: slint::Weak<AppWindow>) -> Result<(Hw, [[u8; 3]; 4], Caps, Probe), String> {
         let (tx, rx) = std::sync::mpsc::channel::<Msg>();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let a = match acer::Acer::open() {
+            let mut a = match acer::Acer::open() {
                 Ok(a) => a,
                 Err(e) => return drop(ready_tx.send(Err(e.to_string()))),
             };
-            let _ = ready_tx.send(Ok(a.zone_colors()));
-            hw_loop(&a, rx);
+            let probe = a.probe();
+            let caps = Caps::from_probe(&model, &probe, pretend_unverified);
+            a.caps = Some(caps.clone());
+            let _ = ready_tx.send(Ok((a.zone_colors(), caps, probe)));
+            hw_loop(&a, rx, move || {
+                let _ = ui.upgrade_in_event_loop(|ui| ui.invoke_tray_action("curve-refused".into()));
+            });
         });
-        let zones = ready_rx.recv().map_err(|e| e.to_string())??;
-        Ok((Hw(tx), zones))
+        let (zones, caps, probe) = ready_rx.recv().map_err(|e| e.to_string())??;
+        Ok((Hw(tx), zones, caps, probe))
+    }
+
+    /// Queues a job without waiting for it (for long jobs such as the fan test).
+    fn spawn(&self, f: impl FnOnce(&acer::Acer) + Send + 'static) {
+        let _ = self.0.send(Msg::Job(Box::new(f)));
     }
 
     fn run<T: Send + 'static>(&self, f: impl FnOnce(&acer::Acer) -> T + Send + 'static) -> Option<T> {
@@ -159,13 +173,17 @@ impl Hw {
     }
 }
 
-fn hw_loop(a: &acer::Acer, rx: std::sync::mpsc::Receiver<Msg>) {
+/// Refused curve writes in a row before the curve is stopped and the fans handed back to Auto.
+const CURVE_REFUSALS: u32 = 2;
+
+fn hw_loop(a: &acer::Acer, rx: std::sync::mpsc::Receiver<Msg>, on_refused: impl Fn()) {
     use std::sync::mpsc::RecvTimeoutError;
     use std::time::Instant;
     let mut curve: Option<(Curve, Curve)> = None;
     // Speeds the curve last sent (CPU, GPU); 0 = nothing sent yet.
     let mut sent = (0u8, 0u8);
     let mut next = Instant::now();
+    let mut refusals = 0;
     loop {
         let msg = if curve.is_some() {
             rx.recv_timeout(next.saturating_duration_since(Instant::now()))
@@ -177,6 +195,7 @@ fn hw_loop(a: &acer::Acer, rx: std::sync::mpsc::Receiver<Msg>) {
             Ok(Msg::Curve(c)) => {
                 curve = c;
                 sent = (0, 0);
+                refusals = 0;
                 next = Instant::now(); // apply the new curve at once
             }
             Err(RecvTimeoutError::Timeout) => {}
@@ -185,7 +204,22 @@ fn hw_loop(a: &acer::Acer, rx: std::sync::mpsc::Receiver<Msg>) {
         if let Some((cc, gc)) = curve.as_ref() {
             if Instant::now() >= next {
                 next = Instant::now() + CURVE_PERIOD;
-                sent = run_curve(a, a.temps(), cc, gc, sent);
+                match run_curve(a, a.temps(), cc, gc, sent) {
+                    Some(s) => {
+                        sent = s;
+                        refusals = 0;
+                    }
+                    None => {
+                        // The firmware said no (not a WMI hiccup): stop rather than retry forever.
+                        sent = (0, 0);
+                        refusals += 1;
+                        if refusals >= CURVE_REFUSALS {
+                            curve = None;
+                            let _ = a.fans_auto();
+                            on_refused();
+                        }
+                    }
+                }
             }
         }
     }
@@ -219,6 +253,40 @@ struct State {
     dragging: bool,
     kb: Kb,
     visible: bool,
+    /// What the laptop supports; None when the Acer controls can't be reached.
+    caps: Option<Caps>,
+    probe: Probe,
+    sys: SysInfo,
+    /// Curves and fixed speeds allowed: verified model, or the fan test passed on this model/BIOS.
+    fans_unlocked: bool,
+    fan_testing: bool,
+    /// Message under the fan test button.
+    fan_test: String,
+    /// What the last fan test measured, for diagnostics.
+    fan_test_detail: String,
+}
+
+/// Machine details for diagnostics, read from the registry.
+#[derive(Default)]
+struct SysInfo {
+    maker: String,
+    model: String,
+    bios: String,
+    windows: String,
+}
+
+impl SysInfo {
+    fn read() -> SysInfo {
+        let bios = "HARDWARE\\DESCRIPTION\\System\\BIOS";
+        let nt = "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion";
+        let get = |k: &str, v: &str| reg_string(k, v).unwrap_or_default();
+        SysInfo {
+            maker: get(bios, "SystemManufacturer"),
+            model: get(bios, "SystemProductName"),
+            bios: get(bios, "BIOSVersion"),
+            windows: format!("build {} ({})", get(nt, "CurrentBuild"), get(nt, "DisplayVersion")),
+        }
+    }
 }
 
 impl State {
@@ -299,6 +367,11 @@ impl App {
 
     /// Runs one hardware action. Failures show a plain banner; the raw error goes under "Details".
     fn act(&self, what: &str, f: impl FnOnce(&acer::Acer) -> Result<bool, wmi::WMIError> + Send + 'static) -> bool {
+        if self.st.borrow().fan_testing {
+            // The hardware thread is busy with the fan test; waiting would freeze the window.
+            self.error("Wait for the fan test to finish (about 12 seconds), then try again.", &format!("{what}: fan test running"));
+            return false;
+        }
         let st = self.st.borrow();
         let result = st.hw.as_ref().map(|h| h.run(move |a| f(a).map_err(|e| e.to_string())).unwrap_or(Err("WMI thread stopped".into())));
         let (text, details) = match result {
@@ -402,10 +475,14 @@ impl App {
         self.tick_timer.stop();
         self.fan_timer.stop();
         self.kb_timer.stop();
-        if let Some(h) = self.st.borrow().hw.as_ref() {
+        let st = self.st.borrow();
+        if let Some(h) = st.hw.as_ref() {
             h.set_curve(None);
-            let _ = h.run(|a| a.fans_auto());
+            if st.caps.as_ref().map_or(true, |c| c.fan_control) {
+                let _ = h.run(|a| a.fans_auto());
+            }
         }
+        drop(st);
         let _ = self.tray.hide();
         let _ = slint::quit_event_loop();
     }
@@ -413,10 +490,15 @@ impl App {
     fn tray_action(self: &Rc<Self>, id: &str) {
         match id {
             "open" => self.show(),
+            "refit" => self.fit_window(),
             "exit" => self.exit(),
+            "curve-refused" => self.curve_refused(),
             m if m.starts_with("mode") => {
-                let i = m[4..].parse().unwrap_or(0);
-                self.pick_fan(Fan::from_chip(i));
+                let fan = Fan::from_chip(m[4..].parse().unwrap_or(0));
+                if !self.fan_allowed(fan) {
+                    self.show(); // the reason shows in the window
+                }
+                self.pick_fan(fan);
             }
             _ => {}
         }
@@ -427,7 +509,8 @@ impl App {
     /// Reads the sensors for the window, only while it is on screen. The curve runs on the
     /// hardware thread (hw_loop) whatever the window does.
     fn tick(&self) {
-        if !self.on_screen() {
+        // During the fan test the hardware thread is busy for ~12 s: waiting here would freeze the window.
+        if !self.on_screen() || self.st.borrow().fan_testing {
             return;
         }
         let st = self.st.borrow();
@@ -443,11 +526,158 @@ impl App {
 
     /// A mode picked by the user (chip or tray): it wins over a slider or drag still waiting to be sent.
     fn pick_fan(&self, fan: Fan) {
+        if self.st.borrow().fan_testing {
+            return;
+        }
         self.fan_timer.stop();
         self.apply_fan(fan);
     }
 
+    // ---- fan test, diagnostics ----
+
+    /// Runs both fans at 30 % then 100 %, checks the RPM follows, then hands them back to Auto.
+    /// Runs on the hardware thread; the result arrives through the fan-test-done callback.
+    fn start_fan_test(&self) {
+        let mut st = self.st.borrow_mut();
+        let (Some(h), Some(caps)) = (st.hw.as_ref(), st.caps.clone()) else { return };
+        if st.fan_testing || !caps.fan_control {
+            return;
+        }
+        h.set_curve(None);
+        let ui = self.ui.as_weak();
+        h.spawn(move |a| {
+            let (pass, text) = fan_test(a, &caps);
+            let _ = ui.upgrade_in_event_loop(move |ui| ui.invoke_fan_test_done(pass, text.into()));
+        });
+        st.fan_testing = true;
+        st.fan = Fan::Auto;
+        st.fan_test = "Testing… the fans will speed up for about 12 seconds.".into();
+        drop(st);
+        self.clear_error();
+        self.refresh_fan();
+    }
+
+    fn fan_test_done(&self, pass: bool, text: &str) {
+        {
+            let mut st = self.st.borrow_mut();
+            st.fan_testing = false;
+            st.fans_unlocked = pass;
+            let key = match (&st.caps, pass) {
+                (Some(c), true) => c.test_key(&st.sys.bios),
+                _ => "fail".into(),
+            };
+            st.settings.set("fan_test", key);
+            st.settings.set("fan_mode", "auto");
+            st.settings.save();
+            st.fan_test_detail = format!("{} ({text})", if pass { "passed" } else { "failed" });
+            st.fan_test = if pass {
+                "Fan test passed. All fan modes are unlocked.".into()
+            } else {
+                format!("Didn't pass ({text}). The fans stay on Auto. Please report this model so it can be added.")
+            };
+        }
+        self.apply_fan(Fan::Auto);
+        // The curve panel or a longer message may have appeared.
+        let ui = self.ui.as_weak();
+        Timer::single_shot(Duration::from_millis(50), move || {
+            if let Some(ui) = ui.upgrade() {
+                ui.invoke_tray_action("refit".into());
+            }
+        });
+    }
+
+    fn diagnostics(&self) -> String {
+        let st = self.st.borrow();
+        let now = st
+            .hw
+            .as_ref()
+            .filter(|_| !st.fan_testing)
+            .and_then(|h| h.run(|a| a.telemetry()))
+            .map_or("no readings".into(), |t| {
+                format!("CPU {} °C, GPU {} °C, CPU fan {} rpm, GPU fan {} rpm", t.cpu_temp, t.gpu_temp, t.cpu_rpm, t.gpu_rpm)
+            });
+        let no_caps = Caps::from_probe(&st.sys.model, &Probe::default(), false);
+        let fan_test = if st.fan_test_detail.is_empty() { st.settings.get("fan_test").unwrap_or("not run").to_string() } else { st.fan_test_detail.clone() };
+        let fan_test = if st.caps.as_ref().map_or(false, |c| c.verified) { "not needed (verified model)".into() } else { fan_test };
+        let text = caps::Report {
+            version: env!("CARGO_PKG_VERSION"),
+            windows: &st.sys.windows,
+            maker: &st.sys.maker,
+            bios: &st.sys.bios,
+            caps: st.caps.as_ref().unwrap_or(&no_caps),
+            probe: &st.probe,
+            fan_test: &fan_test,
+            now: &now,
+        }
+        .text();
+        if st.caps.is_none() {
+            format!("{text}Acer controls unavailable: {}\n", st.acer_error)
+        } else {
+            text
+        }
+    }
+
+    fn copy_diagnostics(&self) {
+        if set_clipboard(&self.diagnostics()) {
+            self.ui.set_diag_note("Diagnostics copied. Paste them into a GitHub issue.".into());
+        } else {
+            self.error("Couldn't copy to the clipboard. Try again.", "OpenClipboard/SetClipboardData failed");
+        }
+    }
+
+    /// Opens a pre-filled "model report" issue in the browser; the diagnostics also go to the clipboard.
+    fn report_model(&self) {
+        let text = self.diagnostics();
+        let copied = set_clipboard(&text);
+        let model = self.st.borrow().sys.model.clone();
+        let url = format!(
+            "https://github.com/deadnme/NitroRust/issues/new?template=model-report.yml&title={}&model={}&diagnostics={}",
+            caps::url_encode(&format!("Model report: {model}")),
+            caps::url_encode(&model),
+            caps::url_encode(&text),
+        );
+        let clip = if copied { " The diagnostics are also on the clipboard." } else { "" };
+        if open_url(&url) {
+            self.ui.set_diag_note(format!("Opened GitHub in your browser.{clip}").into());
+        } else {
+            self.error(&format!("Couldn't open the browser.{clip}"), &url);
+        }
+    }
+
+    /// Auto and Max only need fan control; the rest also needs a verified model or a passed fan test.
+    fn fan_allowed(&self, fan: Fan) -> bool {
+        let st = self.st.borrow();
+        let Some(c) = st.caps.as_ref() else { return true }; // no controls: act() explains
+        match fan {
+            Fan::Auto | Fan::Max => c.fan_control && !st.fan_testing,
+            Fan::Fixed => c.fan_control && st.fans_unlocked && !st.fan_testing,
+            // A curve follows the CPU temperature.
+            Fan::Preset(_) | Fan::CustomCurve => c.fan_control && c.cpu_temp && st.fans_unlocked && !st.fan_testing,
+        }
+    }
+
     fn apply_fan(&self, fan: Fan) {
+        if !self.fan_allowed(fan) {
+            let (testing, control, cpu_temp, unlocked) = {
+                let st = self.st.borrow();
+                let c = st.caps.as_ref();
+                (st.fan_testing, c.map_or(true, |c| c.fan_control), c.map_or(true, |c| c.cpu_temp), st.fans_unlocked)
+            };
+            if !testing && fan != Fan::Auto {
+                let text = if !control {
+                    "This laptop doesn't let apps control its fans."
+                } else if !unlocked {
+                    "Run the fan control test in Advanced first. It unlocks Quiet, Balanced, Cool and your own settings."
+                } else if !cpu_temp {
+                    "Fan curves need a CPU temperature, and this laptop doesn't report one."
+                } else {
+                    "That fan mode isn't available."
+                };
+                self.error(text, "fan mode blocked by the startup probe or the fan test");
+            }
+            self.refresh_fan();
+            return;
+        }
         // Stop a running curve before a fixed mode is sent, so no curve step can override it.
         let previous = {
             let st = self.st.borrow();
@@ -470,6 +700,10 @@ impl App {
             // The new mode was refused: keep the old curve running rather than leave the fans as they are.
             if let (Some(h), Some(c)) = (self.st.borrow().hw.as_ref(), previous) {
                 h.set_curve(Some(c));
+            }
+            let untested = self.st.borrow().caps.as_ref().map_or(false, |c| !c.verified);
+            if untested && fan != Fan::Auto {
+                self.lock_fans();
             }
         }
         if ok {
@@ -507,8 +741,48 @@ impl App {
         }
     }
 
+    /// The hardware thread stopped a curve the firmware kept refusing; the fans are already on Auto.
+    fn curve_refused(&self) {
+        let untested = self.st.borrow().caps.as_ref().map_or(false, |c| !c.verified);
+        if untested {
+            return self.lock_fans();
+        }
+        {
+            let mut st = self.st.borrow_mut();
+            st.fan = Fan::Auto;
+            st.settings.set("fan_mode", "auto");
+            st.settings.save();
+        }
+        self.error("The laptop refused the fan curve, so the fans are back on Auto.", "SetGamingFanSpeed refused twice in a row");
+        self.refresh_fan();
+    }
+
+    /// An untested model refused a fan write: back to Auto, and curves stay off until a new test passes.
+    fn lock_fans(&self) {
+        {
+            let mut st = self.st.borrow_mut();
+            st.fans_unlocked = false;
+            st.fan = Fan::Auto;
+            st.settings.set("fan_test", "refused");
+            st.settings.set("fan_mode", "auto");
+            st.settings.save();
+            if let Some(h) = st.hw.as_ref() {
+                h.set_curve(None);
+                let _ = h.run(|a| a.fans_auto());
+            }
+        }
+        self.error(
+            "This laptop refused that fan setting, so the fans are back on Auto. Curves are off until the fan test passes again.",
+            "fan write refused on an untested model",
+        );
+        self.refresh_fan();
+    }
+
     fn refresh_fan(&self) {
         let st = self.st.borrow();
+        self.ui.set_fans_unlocked(st.fans_unlocked);
+        self.ui.set_fan_testing(st.fan_testing);
+        self.ui.set_fan_test_text(st.fan_test.as_str().into());
         self.ui.set_fan_mode(st.fan.chip());
         self.tray.set_fan_mode(st.fan.chip());
         let shown = st.shown_curve();
@@ -639,6 +913,9 @@ impl App {
     // ---- keyboard ----
 
     fn apply_kb(&self) {
+        if !self.st.borrow().caps.as_ref().map_or(true, |c| c.kb) {
+            return self.refresh_kb();
+        }
         let kb = self.st.borrow().kb;
         let bright = if kb.on { kb.bright } else { 0 };
         let ok = if kb.effect_mode {
@@ -673,7 +950,9 @@ impl App {
         self.ui.set_kb_brightness(kb.bright as f32);
         self.ui.set_kb_color(rgb(if kb.effect_mode { kb.color } else { kb.zones[0] }));
         self.ui.set_kb_color_known(kb.effect_mode || same);
-        self.ui.set_effect_label(if kb.effect_mode {
+        let zones_ok = self.st.borrow().caps.as_ref().map_or(true, |c| c.zones);
+        // Without zone colours, one colour is the Static effect: no "Effect:" label for it.
+        self.ui.set_effect_label(if kb.effect_mode && (zones_ok || kb.effect != 0) {
             format!("Effect: {}", proto::EFFECTS[kb.effect as usize]).into()
         } else {
             SharedString::new()
@@ -690,10 +969,15 @@ impl App {
     }
 
     fn color_picked(&self, c: [u8; 3]) {
+        let zones_ok = self.st.borrow().caps.as_ref().map_or(true, |c| c.zones);
         self.kb_update(|kb| {
             kb.zones = [c; 4];
             kb.color = c;
-            kb.effect_mode = false;
+            // Zone layouts differ between models: elsewhere one colour is set as the Static effect.
+            kb.effect_mode = !zones_ok;
+            if !zones_ok {
+                kb.effect = 0;
+            }
             kb.on = true;
         });
         self.apply_kb();
@@ -718,23 +1002,24 @@ impl App {
 }
 
 /// One curve step: returns the speeds now in force (0 = retry next tick).
-fn run_curve(a: &acer::Acer, t: acer::Telemetry, cc: &Curve, gc: &Curve, (cur_cpu, cur_gpu): (u8, u8)) -> (u8, u8) {
+/// None = the firmware refused the speeds (it is already back on Auto).
+fn run_curve(a: &acer::Acer, t: acer::Telemetry, cc: &Curve, gc: &Curve, (cur_cpu, cur_gpu): (u8, u8)) -> Option<(u8, u8)> {
     if t.cpu_temp == 0 {
         // The CPU sensor read failed: hand control back rather than guess.
         let _ = a.fans_auto();
-        return (0, 0);
+        return Some((0, 0));
     }
     // A sleeping dGPU reads 0 °C: its fan then follows the curve's lowest point.
     let cpu = curve::next_speed(cur_cpu, cc.percent(t.cpu_temp));
     let gpu = curve::next_speed(cur_gpu, gc.percent(t.gpu_temp));
     if cpu.is_none() && gpu.is_none() {
-        return (cur_cpu, cur_gpu);
+        return Some((cur_cpu, cur_gpu));
     }
     let (cpu, gpu) = (cpu.unwrap_or(cur_cpu.max(10)), gpu.unwrap_or(cur_gpu.max(10)));
-    if matches!(a.fans_custom(cpu, gpu), Ok(true)) {
-        (cpu, gpu)
-    } else {
-        (0, 0)
+    match a.fans_custom(cpu, gpu) {
+        Ok(true) => Some((cpu, gpu)),
+        Ok(false) => None,
+        Err(_) => Some((0, 0)), // WMI error: retry next tick
     }
 }
 
@@ -786,6 +1071,96 @@ fn choose_color(initial: [u8; 3]) -> Option<[u8; 3]> {
     }
     let v = cc.rgbResult;
     Some([v as u8, (v >> 8) as u8, (v >> 16) as u8])
+}
+
+/// The fan test (hardware thread). Returns (passed, what was measured).
+fn fan_test(a: &acer::Acer, caps: &Caps) -> (bool, String) {
+    let read = || {
+        let t = a.telemetry();
+        (caps.cpu_rpm.then_some(t.cpu_rpm), caps.gpu_rpm.then_some(t.gpu_rpm))
+    };
+    let show = |r: (Option<u32>, Option<u32>)| {
+        [("CPU", r.0), ("GPU", r.1)]
+            .iter()
+            .filter_map(|(n, v)| v.map(|v| format!("{n} {v} rpm")))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let hold = |pct: u8| -> Result<(Option<u32>, Option<u32>), String> {
+        match a.fans_custom(pct, pct) {
+            Ok(true) => {
+                std::thread::sleep(Duration::from_secs(6));
+                Ok(read())
+            }
+            Ok(false) => Err("the laptop refused the speed change".into()),
+            Err(e) => Err(e.to_string()),
+        }
+    };
+    let result = hold(30).and_then(|low| Ok((low, hold(100)?)));
+    let _ = a.fans_auto();
+    match result {
+        Ok((low, _)) if low.0.is_none() && low.1.is_none() => (false, "no fan speed sensors to check".into()),
+        Ok((low, high)) => (caps::fan_test_passed(low, high), format!("30%: {}; 100%: {}", show(low), show(high))),
+        Err(e) => (false, e),
+    }
+}
+
+/// A REG_SZ value under HKEY_LOCAL_MACHINE.
+fn reg_string(key: &str, value: &str) -> Option<String> {
+    use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ};
+    let (k, v) = (wide(key), wide(value));
+    let mut buf = [0u16; 256];
+    let mut size = (buf.len() * 2) as u32;
+    let err = unsafe {
+        RegGetValueW(HKEY_LOCAL_MACHINE, k.as_ptr(), v.as_ptr(), RRF_RT_REG_SZ, std::ptr::null_mut(), buf.as_mut_ptr() as *mut _, &mut size)
+    };
+    if err != 0 {
+        return None;
+    }
+    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    Some(String::from_utf16_lossy(&buf[..len]).trim().to_string())
+}
+
+/// Puts text on the Windows clipboard.
+fn set_clipboard(text: &str) -> bool {
+    use windows_sys::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData};
+    use windows_sys::Win32::Foundation::GlobalFree;
+    use windows_sys::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+    const CF_UNICODETEXT: u32 = 13;
+    let data = wide(&text.replace('\n', "\r\n"));
+    unsafe {
+        if OpenClipboard(std::ptr::null_mut()) == 0 {
+            return false;
+        }
+        EmptyClipboard();
+        let mem = GlobalAlloc(GMEM_MOVEABLE, data.len() * 2);
+        let mut ok = false;
+        if !mem.is_null() {
+            let p = GlobalLock(mem) as *mut u16;
+            if !p.is_null() {
+                std::ptr::copy_nonoverlapping(data.as_ptr(), p, data.len());
+                GlobalUnlock(mem);
+                // On success the clipboard owns the memory.
+                ok = !SetClipboardData(CF_UNICODETEXT, mem as _).is_null();
+            }
+            if !ok {
+                GlobalFree(mem);
+            }
+        }
+        CloseClipboard();
+        ok
+    }
+}
+
+/// Opens a web address in the default browser.
+fn open_url(url: &str) -> bool {
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    let (verb, target) = (wide("open"), wide(url));
+    let r = unsafe {
+        ShellExecuteW(std::ptr::null_mut(), verb.as_ptr(), target.as_ptr(), std::ptr::null(), std::ptr::null(), SW_SHOWNORMAL)
+    };
+    r as isize > 32
 }
 
 /// One copy only. Returns true when another copy is already running.
@@ -851,10 +1226,17 @@ fn listen_for_second_copy(ui: slint::Weak<AppWindow>, event: &str, action: &'sta
 
 fn build(ui: AppWindow, tray: Tray) -> Rc<App> {
     let settings = Settings::load();
-    let (hw, mut zones, acer_error) = match Hw::open() {
-        Ok((h, z)) => (Some(h), z, String::new()),
-        Err(e) => (None, [[255, 255, 255]; 4], e),
+    let sys = SysInfo::read();
+    // For testing safe mode on a verified laptop.
+    let pretend = std::env::var("NITRORUST_PRETEND_UNVERIFIED").map_or(false, |v| v == "1");
+    let model = if pretend { format!("{} (pretend)", sys.model) } else { sys.model.clone() };
+    let (hw, mut zones, acer_error, caps, probe) = match Hw::open(model, pretend, ui.as_weak()) {
+        Ok((h, z, c, p)) => (Some(h), z, String::new(), Some(c), p),
+        Err(e) => (None, [[255, 255, 255]; 4], e, None, Probe::default()),
     };
+    let fans_unlocked = caps.as_ref().map_or(true, |c| {
+        c.verified || settings.get("fan_test") == Some(c.test_key(&sys.bios).as_str())
+    });
     let (fan, cpu_curve, gpu_curve, separate) = load_fan(&settings);
     let pct = |k: &str| settings.num::<u8>(k).unwrap_or(50).clamp(10, 100);
     for (i, key) in ["zone1", "zone2", "zone3", "zone4"].iter().enumerate() {
@@ -862,7 +1244,7 @@ fn build(ui: AppWindow, tray: Tray) -> Rc<App> {
             zones[i] = c;
         }
     }
-    let kb = Kb {
+    let mut kb = Kb {
         on: settings.get("kb_on") != Some("0"),
         effect_mode: settings.get("kb_mode") == Some("effect"),
         effect: settings.num::<u8>("kb_effect").unwrap_or(0).min(proto::EFFECTS.len() as u8 - 1),
@@ -872,6 +1254,12 @@ fn build(ui: AppWindow, tray: Tray) -> Rc<App> {
         color: settings.get("kb_color").and_then(parse_hex).unwrap_or(zones[0]),
         zones,
     };
+    if caps.as_ref().map_or(false, |c| !c.zones) && !kb.effect_mode {
+        // Saved zone colours, but this model gets one colour as the Static effect.
+        kb.effect_mode = true;
+        kb.effect = 0;
+        kb.color = kb.zones[0];
+    }
     let st = State {
         hw,
         acer_error,
@@ -886,6 +1274,13 @@ fn build(ui: AppWindow, tray: Tray) -> Rc<App> {
         kb,
         visible: false,
         settings,
+        caps,
+        probe,
+        sys,
+        fans_unlocked,
+        fan_testing: false,
+        fan_test: String::new(),
+        fan_test_detail: String::new(),
     };
     let points = Rc::new(VecModel::default());
     ui.set_points(ModelRc::from(points.clone()));
@@ -910,9 +1305,23 @@ impl App {
             ui.set_advanced(st.settings.get("advanced") == Some("1"));
         }
         ui.set_autostart(settings::autostart_enabled());
+        {
+            let st = self.st.borrow();
+            if let Some(c) = st.caps.as_ref() {
+                ui.set_has_cpu_temp(c.cpu_temp);
+                ui.set_has_gpu_temp(c.gpu_temp);
+                ui.set_has_fan_control(c.fan_control);
+                ui.set_has_gpu_fan(c.gpu_fan);
+                ui.set_has_kb(c.kb);
+                ui.set_has_zones(c.zones);
+                let name = if c.model.is_empty() { "Unknown Acer laptop" } else { c.model.as_str() };
+                ui.set_untested_model(if c.verified { SharedString::new() } else { name.into() });
+            }
+        }
         self.wire();
 
-        // Re-apply what was in force last time.
+        // Re-apply what was in force last time, if this laptop allows it.
+        let fan = if self.fan_allowed(fan) { fan } else { Fan::Auto };
         if fan != Fan::Auto {
             self.apply_fan(fan);
         } else {
@@ -1013,6 +1422,10 @@ impl App {
             }
         });
         on!(on_tray_action, |a, id| a.tray_action(&id));
+        on!(on_test_fans, |a| a.start_fan_test());
+        on!(on_fan_test_done, |a, pass, text| a.fan_test_done(pass, &text));
+        on!(on_copy_diagnostics, |a| a.copy_diagnostics());
+        on!(on_report_model, |a| a.report_model());
 
         let app = self.clone();
         self.tray.on_action(move |id| app.tray_action(&id));
@@ -1058,6 +1471,9 @@ fn main() {
     let app = build(ui, tray);
     if !tray_only {
         app.show();
+    } else {
+        // Started hidden (logon): hand start-up memory back once settings are applied.
+        Timer::single_shot(Duration::from_secs(5), trim_memory);
     }
     slint::run_event_loop_until_quit().expect("event loop");
 }
@@ -1144,6 +1560,13 @@ mod tests {
             dragging: false,
             kb: Kb { on: true, effect_mode: false, effect: 0, speed: 5, bright: 100, left: false, zones: [[0; 3]; 4], color: [0; 3] },
             visible: false,
+            caps: None,
+            probe: Probe::default(),
+            sys: SysInfo::default(),
+            fans_unlocked: true,
+            fan_testing: false,
+            fan_test: String::new(),
+            fan_test_detail: String::new(),
         };
         let edited = Curve::parse("60:20 88:80").unwrap();
         st.store_edit(edited.clone());

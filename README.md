@@ -1,9 +1,11 @@
 # NitroRust
 
-A small, fast replacement for Acer NitroSense on the **Acer Nitro AN515-45**, written in Rust.
+A small, fast replacement for Acer NitroSense on **Acer Nitro laptops**, written in Rust.
 
 It controls the fans (modes and your own fan curves), the Windows power plan and the keyboard lighting,
 and shows CPU and GPU temperatures. It sits in the tray and uses almost no memory or CPU.
+At startup it asks the laptop what it supports and only shows those controls
+(see [Supported models](#supported-models)).
 
 ![NitroRust with Advanced on](docs/advanced.png)
 
@@ -34,7 +36,7 @@ and shows CPU and GPU temperatures. It sits in the tray and uses almost no memor
 Measured on the same laptop (Nitro AN515-45, Ryzen 7 5800H, RTX 3060 Laptop, Windows 11),
 each app idle for 30 seconds. CPU is the share of all 16 CPU threads.
 
-| | Acer NitroSense 3.1 | NitroRust 1.0 |
+| | Acer NitroSense 3.1 | NitroRust |
 |---|---|---|
 | **RAM, window open** | 144–147 MB, plus 24 MB for the Predator Service it needs (about 170 MB) | **28–29 MB** |
 | **RAM, minimised / in the tray** | 140 MB + 24 MB | **2.8 MB** |
@@ -54,9 +56,9 @@ The numbers are from one laptop; yours will differ a little.
 
 ## Install
 
-**Needs:** an Acer Nitro AN515-45 and 64-bit Windows 10 or 11.
+**Needs:** an Acer Nitro laptop (see [Supported models](#supported-models)) and 64-bit Windows 10 or 11.
 
-1. Download `NitroRust-Setup-1.0.0.exe` from the [latest release](https://github.com/deadnme/NitroRust/releases/latest).
+1. Download `NitroRust-Setup-<version>.exe` from the [latest release](https://github.com/deadnme/NitroRust/releases/latest).
 2. Run it. Windows SmartScreen may warn because the installer is not signed:
    click **More info**, then **Run anyway**.
 3. Pick the options (Start with Windows is on by default) and click **Install**.
@@ -95,14 +97,46 @@ nitrorust.exe --autostart on|off turn Start with Windows on or off
 nitrorust.exe --exit             close the running copy (fans go back to Auto)
 ```
 
-## Other Acer laptops
+To try safe mode on a verified laptop, start it with the environment variable
+`NITRORUST_PRETEND_UNVERIFIED=1`.
 
-NitroRust talks to Acer's `AcerGamingFunction` WMI interface, the same one NitroSense uses.
-It is only tested on the **Nitro AN515-45**. Other Nitro and Predator models may use different
-fan and lighting commands. Try it on another model at your own risk, and watch your temperatures.
+## Supported models
+
+NitroRust talks to Acer's `AcerGamingFunction` WMI interface, the same one NitroSense and PredatorSense use.
+At startup it asks the laptop, without changing anything, which sensors, fans and lighting it has,
+and hides what isn't there.
+
+| Model | Status |
+|---|---|
+| Nitro AN515-45 | ✅ Verified: everything works |
+| Other Nitro (and Predator) laptops | 🧪 Safe mode, see below |
+
+**Safe mode** (any model not on the verified list):
+
+- Temperatures, **Auto**, **Max**, the power plan and keyboard on/off, colour, brightness and effects work straight away.
+- **Quiet, Balanced, Cool, fixed speeds and your own curve** unlock after the **fan test** (Advanced > Test fan control).
+  It runs the fans at 30 % and then 100 % for about 12 seconds, checks the fan speed follows,
+  and puts them back on Auto. If the laptop ever refuses a fan setting, NitroRust puts the fans back on Auto
+  and locks these modes again.
+- **Per-zone keyboard colours** stay hidden: the zone colour format differs between models.
+  One colour for the whole keyboard still works.
+
+![Safe mode on an untested model](docs/untested.png)
+
+### Add your model
+
+1. Open NitroRust and click **Report this model** in the banner
+   (or **Report a problem** in Advanced on a verified model).
+2. Your browser opens a GitHub issue with your model and a diagnostics report already filled in.
+   The report has no personal details: no user name, serial number or file paths.
+3. Tick what works and submit. Models with good reports get added to the verified list.
+
+**Copy diagnostics** copies the same report if you'd rather paste it yourself.
 
 ## Known limits
 
+- Only the Nitro AN515-45 is verified so far. Firmware power profiles (Quiet/Balanced/Performance/Turbo
+  on newer models) aren't supported yet; the power plan picker uses Windows power plans.
 - Fixed fan speed (Advanced sliders) has no 90 °C safety rule. Use a curve if you want one.
 - If Windows Explorer restarts, the tray icon does not come back until you open NitroRust again.
 - If the laptop's fan controls stop responding, the window can freeze until they answer.
@@ -135,7 +169,8 @@ The installer is written to `installer\Output\`.
 
 ```
 rs/src/main.rs       app logic, tray, single instance, fan curve thread
-rs/src/acer.rs       AcerGamingFunction WMI calls
+rs/src/acer.rs       AcerGamingFunction WMI calls and the read-only startup probe
+rs/src/caps.rs       what the laptop supports, verified models, diagnostics report
 rs/src/proto.rs      WMI payloads for fans, temperatures and keyboard
 rs/src/curve.rs      fan curves and presets
 rs/src/power.rs      Windows power plans

@@ -1,11 +1,27 @@
-//! Acer AcerGamingFunction (root\WMI) payloads for the Nitro AN515-45.
+//! Acer AcerGamingFunction (root\WMI) payloads. Verified on the Nitro AN515-45; the fan and
+//! sensor encodings match the Linux acer-wmi driver, which uses them across Nitro/Predator models.
 //! Values come from Acer's own software as captured by the Linux driver (Linuwu-Sense,
 //! quirk `nitro_sense = 2`) and verified by read-only probes on this machine.
 
-/// Fan mask for this 2-fan model: CPU = bit 0, GPU = bit 3.
-pub const FAN_AUTO: u64 = 0x41_0009;
-pub const FAN_MAX: u64 = 0x82_0009;
-pub const FAN_CUSTOM: u64 = 0xC3_0009;
+/// SetGamingFanBehavior modes.
+pub const MODE_AUTO: u64 = 1;
+pub const MODE_MAX: u64 = 2;
+pub const MODE_CUSTOM: u64 = 3;
+
+/// SetGamingFanBehavior payload: fan bits (CPU = bit 0, GPU = bit 3) and the mode for each fan
+/// (CPU in bits 16-17, GPU in bits 22-23).
+pub fn fan_behavior(cpu: bool, gpu: bool, mode: u64) -> u64 {
+    let mut v = 0;
+    if cpu {
+        v |= 1 | mode << 16;
+    }
+    if gpu {
+        v |= 1 << 3 | mode << 22;
+    }
+    v
+}
+
+/// SetGamingFanSpeed fan IDs.
 pub const FAN_CPU: u64 = 1;
 pub const FAN_GPU: u64 = 4;
 
@@ -66,6 +82,11 @@ mod tests {
     #[test]
     fn payloads() {
         assert_eq!(fan_speed(FAN_CPU, 70), 0x4601);
+        // The values verified on the AN515-45 (both fans).
+        assert_eq!(fan_behavior(true, true, MODE_AUTO), 0x41_0009);
+        assert_eq!(fan_behavior(true, true, MODE_MAX), 0x82_0009);
+        assert_eq!(fan_behavior(true, true, MODE_CUSTOM), 0xC3_0009);
+        assert_eq!(fan_behavior(true, false, MODE_AUTO), 0x1_0001);
         assert_eq!(fan_speed(FAN_GPU, 0), 0x0A04); // clamped to the floor
         assert_eq!(fan_speed(FAN_GPU, 255), 0x6404);
         // Probe values read on the AN515-45: 0x4900 = 73 C, 0xBB800 = 3000 rpm.
