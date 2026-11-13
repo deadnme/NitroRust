@@ -1,0 +1,693 @@
+// NitroRust UI. A simple view for everyone, plus an "Advanced" section that power users switch on.
+// Every colour comes from Palette (follows Windows light/dark) or the Theme tokens below.
+
+import { Button, Switch, CheckBox, Slider, ComboBox, ScrollView, LineEdit, Palette } from "std-widgets.slint";
+
+export struct CurvePoint { t: int, p: int }
+
+export global Theme {
+    // Windows accent colour, read from the registry at start.
+    in property <color> accent: #0078d4;
+    out property <color> on-accent: #ffffff;
+    out property <color> cool: Palette.color-scheme == ColorScheme.dark ? #5cc98a : #1f7a45;
+    out property <color> warm: Palette.color-scheme == ColorScheme.dark ? #e8b44c : #9a6400;
+    out property <color> hot: Palette.color-scheme == ColorScheme.dark ? #ff7a6b : #c1281a;
+    out property <color> muted: Palette.color-scheme == ColorScheme.dark ? #a0a0a0 : #5f5f5f;
+    out property <color> danger-bg: Palette.color-scheme == ColorScheme.dark ? #4a2020 : #fde7e4;
+    out property <length> gap: 8px;
+    out property <length> section-gap: 20px;
+    out property <length> radius: 6px;
+}
+
+component Heading inherits Text {
+    font-size: 14px;
+    font-weight: 600;
+    color: Palette.foreground;
+}
+
+component Hint inherits Text {
+    font-size: 12px;
+    color: Theme.muted;
+    wrap: word-wrap;
+}
+
+// A selectable pill. Keyboard: Tab to it, Space or Enter picks it.
+component Chip inherits Rectangle {
+    in property <string> text;
+    in property <bool> selected;
+    in property <bool> clickable: true;
+    callback clicked;
+    min-height: 34px;
+    min-width: 0px;
+    horizontal-stretch: 1;
+    border-radius: Theme.radius;
+    background: selected ? Theme.accent : (ta.has-hover && clickable ? Palette.alternate-background : Palette.control-background);
+    border-width: fs.has-focus ? 2px : 1px;
+    border-color: fs.has-focus ? Palette.foreground : (selected ? Theme.accent : Palette.border);
+    accessible-role: button;
+    accessible-label: text;
+    accessible-checked: selected;
+    accessible-action-default => { if clickable { clicked(); } }
+    Text {
+        text: root.text;
+        color: root.selected ? Theme.on-accent : Palette.foreground;
+        font-weight: root.selected ? 600 : 400;
+        font-size: 13px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    // Under the TouchArea: it only takes keyboard focus (Tab), so the ring never shows on a mouse click.
+    fs := FocusScope {
+        enabled: root.clickable;
+        key-pressed(e) => {
+            if e.text == " " || e.text == Key.Return { root.clicked(); return accept; }
+            reject
+        }
+    }
+    ta := TouchArea {
+        enabled: root.clickable;
+        mouse-cursor: root.clickable ? pointer : default;
+        clicked => { root.clicked(); }
+    }
+}
+
+component Swatch inherits Rectangle {
+    in property <color> value;
+    in property <bool> selected;
+    callback picked(color);
+    width: 24px;
+    height: 24px;
+    border-radius: 12px;
+    background: value;
+    border-width: selected || fs.has-focus ? 3px : 1px;
+    border-color: selected || fs.has-focus ? Palette.foreground : Palette.border;
+    accessible-role: button;
+    accessible-label: "Colour " + value.to-hsv().hue.round();
+    accessible-action-default => { picked(value); }
+    fs := FocusScope {
+        key-pressed(e) => {
+            if e.text == " " || e.text == Key.Return { root.picked(root.value); return accept; }
+            reject
+        }
+    }
+    TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.picked(root.value); }
+    }
+}
+
+// A row of preset colours plus "More…" for the Windows colour dialog.
+component SwatchRow inherits HorizontalLayout {
+    in property <[color]> swatches;
+    in property <color> current;
+    in property <bool> show-current;
+    callback picked(color);
+    callback more();
+    spacing: 6px;
+    alignment: start;
+    for c in swatches: Swatch {
+        value: c;
+        selected: root.show-current && c == root.current;
+        picked(v) => { root.picked(v); }
+    }
+    // "More colours": the Windows colour dialog.
+    Rectangle {
+        width: 24px;
+        height: 24px;
+        border-radius: 12px;
+        background: more-ta.has-hover ? Palette.alternate-background : Palette.control-background;
+        border-width: more-fs.has-focus ? 3px : 1px;
+        border-color: more-fs.has-focus ? Palette.foreground : Palette.border;
+        accessible-role: button;
+        accessible-label: "More colours";
+        accessible-action-default => { root.more(); }
+        Text { text: "+"; color: Palette.foreground; font-size: 16px; horizontal-alignment: center; vertical-alignment: center; }
+        more-fs := FocusScope {
+            key-pressed(e) => {
+                if e.text == " " || e.text == Key.Return { root.more(); return accept; }
+                reject
+            }
+        }
+        more-ta := TouchArea {
+            mouse-cursor: pointer;
+            clicked => { root.more(); }
+        }
+    }
+}
+
+component TempTile inherits Rectangle {
+    in property <string> name;
+    in property <int> temp;
+    in property <int> rpm;
+    in property <bool> show-rpm;
+    horizontal-stretch: 1;
+    border-radius: Theme.radius;
+    background: Palette.alternate-background;
+    property <string> state: temp <= 0 ? "Sleeping" : temp < 60 ? "Cool" : temp <= 80 ? "Warm" : "Hot";
+    property <color> tone: temp <= 0 ? Theme.muted : temp < 60 ? Theme.cool : temp <= 80 ? Theme.warm : Theme.hot;
+    accessible-role: text;
+    accessible-label: name + " " + (temp <= 0 ? "sleeping" : temp + " degrees, " + state);
+    VerticalLayout {
+        padding: 12px;
+        spacing: 2px;
+        Text { text: root.name; font-size: 12px; color: Theme.muted; }
+        HorizontalLayout {
+            spacing: 8px;
+            alignment: start;
+            Text {
+                text: root.temp <= 0 ? "--" : root.temp + " °C";
+                font-size: 26px;
+                font-weight: 600;
+                color: Palette.foreground;
+                vertical-alignment: center;
+            }
+            Rectangle {
+                width: label.preferred-width + 14px;
+                height: 22px;
+                y: (parent.height - self.height) / 2;
+                border-radius: 11px;
+                background: root.tone.with-alpha(0.15);
+                label := Text {
+                    text: root.state;
+                    color: root.tone;
+                    font-size: 12px;
+                    font-weight: 600;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+        }
+        if root.show-rpm: Text {
+            text: root.rpm + " rpm";
+            font-size: 12px;
+            color: Theme.muted;
+        }
+    }
+}
+
+// Temperature across (30-100 °C), fan speed up (0-100 %). Points can be dragged.
+component CurveGraph inherits Rectangle {
+    in property <[CurvePoint]> points;
+    in property <string> path-commands;
+    in property <int> live-temp;
+    callback dragged(int, int, int);
+    callback drag-ended();
+    height: 170px;
+    border-radius: Theme.radius;
+    background: Palette.alternate-background;
+    border-width: 1px;
+    border-color: Palette.border;
+    accessible-role: image;
+    accessible-label: "Fan curve. Use the text box below for exact values.";
+
+    // Grid: every 10 °C, and 25 % steps.
+    for g in [40, 50, 60, 70, 80, 90]: Rectangle {
+        x: (g - 30) / 70 * root.width;
+        width: 1px;
+        height: root.height;
+        background: Palette.border;
+    }
+    for g in [25, 50, 75]: Rectangle {
+        y: (100 - g) / 100 * root.height;
+        height: 1px;
+        width: root.width;
+        background: Palette.border;
+    }
+    // Failsafe zone: always 100 % from 90 °C.
+    Rectangle {
+        x: (90 - 30) / 70 * root.width;
+        width: root.width - self.x;
+        height: root.height;
+        background: Theme.hot.with-alpha(0.10);
+    }
+    // Where the temperature is right now.
+    if root.live-temp > 30 && root.live-temp < 100: Rectangle {
+        x: (root.live-temp - 30) / 70 * root.width;
+        width: 2px;
+        height: root.height;
+        background: Theme.accent.with-alpha(0.45);
+    }
+    Path {
+        width: root.width;
+        height: root.height;
+        viewbox-width: 100;
+        viewbox-height: 100;
+        fit: fill; // stretch the 100x100 box to the graph, not keep it square
+        commands: root.path-commands;
+        stroke: Theme.accent;
+        stroke-width: 2px;
+        fill: transparent;
+    }
+    for pt[i] in root.points: Rectangle {
+        width: 22px;
+        height: 22px;
+        x: (pt.t - 30) / 70 * root.width - 11px;
+        y: (100 - pt.p) / 100 * root.height - 11px;
+        Rectangle {
+            width: 14px;
+            height: 14px;
+            border-radius: 7px;
+            background: ta.pressed || ta.has-hover ? Theme.accent : Palette.background;
+            border-width: 2px;
+            border-color: Theme.accent;
+        }
+        ta := TouchArea {
+            mouse-cursor: move;
+            moved => {
+                if self.pressed {
+                    root.dragged(i,
+                        round((parent.x + self.mouse-x - self.pressed-x + 11px) / root.width * 70 + 30),
+                        round(100 - (parent.y + self.mouse-y - self.pressed-y + 11px) / root.height * 100));
+                }
+            }
+            pointer-event(e) => {
+                if e.kind == PointerEventKind.up { root.drag-ended(); }
+            }
+        }
+    }
+}
+
+// A section of the window: a filled tile, never nested inside another tile.
+component Panel inherits Rectangle {
+    border-radius: Theme.radius;
+    background: Palette.alternate-background.mix(Palette.background, 0.5);
+    border-width: 1px;
+    border-color: Palette.border;
+}
+
+export component AppWindow inherits Window {
+    title: "NitroRust";
+    icon: @image-url("icon.png");
+    min-width: 940px;
+    min-height: 320px;
+    preferred-width: 980px;
+    preferred-height: 560px;
+    background: Palette.background;
+
+    // Telemetry
+    in property <int> cpu-temp;
+    in property <int> gpu-temp;
+    in property <int> cpu-rpm;
+    in property <int> gpu-rpm;
+
+    // Fans: 0 Auto, 1 Quiet, 2 Balanced, 3 Cool, 4 Max, 5 Custom (set in Advanced)
+    in property <int> fan-mode;
+    callback fan-mode-picked(int);
+
+    // Power plan
+    in property <[string]> power-plans;
+    in-out property <int> power-index;
+    callback power-picked(int);
+
+    // Keyboard (simple)
+    in-out property <bool> kb-on: true;
+    in property <color> kb-color;
+    in property <bool> kb-color-known;
+    in-out property <float> kb-brightness: 100;
+    in property <string> effect-label;
+    in property <[color]> swatches;
+    callback kb-on-toggled(bool);
+    callback color-picked(color);
+    callback more-colors();
+    callback brightness-changed(int);
+
+    in-out property <bool> autostart;
+    callback autostart-toggled(bool);
+
+    in-out property <bool> advanced;
+    callback advanced-toggled(bool);
+    out property <length> content-height: content.preferred-height;
+
+    // Friendly error banner; details hold the raw error.
+    in property <string> error-text;
+    in property <string> error-details;
+    property <bool> show-details;
+    callback dismiss-error();
+
+    // Advanced: fixed fan speed
+    in-out property <float> cpu-fixed: 50;
+    in-out property <float> gpu-fixed: 50;
+    callback fixed-changed(int, int);
+
+    // Advanced: curve
+    in property <[CurvePoint]> points;
+    in property <string> path-commands;
+    in-out property <string> curve-text;
+    in property <string> curve-error;
+    in property <string> curve-caption;
+    in-out property <bool> separate-gpu;
+    in-out property <int> curve-target; // 0 CPU, 1 GPU
+    callback point-dragged(int, int, int);
+    callback drag-ended();
+    callback curve-text-entered(string);
+    callback separate-toggled(bool);
+    callback curve-target-picked(int);
+
+    // Advanced: keyboard
+    in property <[string]> effects;
+    in-out property <int> effect-index;
+    in-out property <float> kb-speed: 5;
+    in-out property <bool> kb-left;
+    in property <[color]> zones;
+    callback effect-picked(int);
+    callback kb-speed-changed(int);
+    callback kb-left-toggled(bool);
+    callback zone-picked(int, color);
+    callback zone-more(int);
+
+    // Tray menu and second-copy launches arrive here.
+    callback tray-action(string);
+
+    property <[string]> mode-names: ["Auto", "Quiet", "Balanced", "Cool", "Max"];
+    property <[string]> mode-hints: [
+        "The laptop decides: quiet when idle, faster under load.",
+        "Fans stay slow and quiet until about 80 °C.",
+        "Close to Auto when idle, ramps up under load.",
+        "Fans run faster to keep temperatures lower.",
+        "Full speed. Loud, but as cool as it gets.",
+        "Using your own settings from Advanced. Pick a mode to switch back.",
+    ];
+    property <int> zone-editing: -1;
+
+    ScrollView {
+        content-width: max(self.visible-width, content.min-width);
+        content-height: content.preferred-height;
+        content := VerticalLayout {
+            width: max(parent.visible-width, self.min-width);
+            padding: 16px;
+            padding-top: 12px;
+            spacing: 16px;
+
+            // Header
+            HorizontalLayout {
+                spacing: 16px;
+                Text {
+                    text: "NitroRust";
+                    font-size: 20px;
+                    font-weight: 600;
+                    color: Palette.foreground;
+                    vertical-alignment: center;
+                }
+                Rectangle { horizontal-stretch: 1; }
+                Switch {
+                    text: "Start with Windows";
+                    checked <=> root.autostart;
+                    toggled => { root.autostart-toggled(self.checked); }
+                }
+                Switch {
+                    text: "Advanced";
+                    checked <=> root.advanced;
+                    toggled => { root.advanced-toggled(self.checked); }
+                }
+            }
+
+            // Error banner
+            if root.error-text != "": Rectangle {
+                border-radius: Theme.radius;
+                background: Theme.danger-bg;
+                VerticalLayout {
+                    padding: 10px;
+                    spacing: 4px;
+                    HorizontalLayout {
+                        spacing: Theme.gap;
+                        Text {
+                            text: root.error-text;
+                            wrap: word-wrap;
+                            color: Palette.foreground;
+                            horizontal-stretch: 1;
+                            vertical-alignment: center;
+                        }
+                        Button {
+                            text: root.show-details ? "Hide details" : "Details";
+                            clicked => { root.show-details = !root.show-details; }
+                        }
+                        Button {
+                            text: "Dismiss";
+                            clicked => { root.show-details = false; root.dismiss-error(); }
+                        }
+                    }
+                    if root.show-details: Text {
+                        text: root.error-details;
+                        wrap: word-wrap;
+                        font-size: 12px;
+                        color: Theme.muted;
+                    }
+                }
+            }
+
+            // Three columns, like Acer's NitroSense: temperatures, fans + power, keyboard.
+            HorizontalLayout {
+                spacing: 16px;
+
+                // Temperatures
+                VerticalLayout {
+                    width: 210px;
+                    spacing: Theme.gap;
+                    alignment: start;
+                    TempTile { name: "Processor (CPU)"; temp: root.cpu-temp; rpm: root.cpu-rpm; show-rpm: root.advanced; }
+                    TempTile { name: "Graphics (GPU)"; temp: root.gpu-temp; rpm: root.gpu-rpm; show-rpm: root.advanced; }
+                }
+
+                // Fans and power plan
+                Panel {
+                    min-width: 340px;
+                    horizontal-stretch: 1;
+                    VerticalLayout {
+                        padding: 14px;
+                        spacing: Theme.gap;
+                        alignment: start;
+                        Heading { text: "Fans"; }
+                        HorizontalLayout {
+                            spacing: 6px;
+                            for name[i] in root.mode-names: Chip {
+                                text: name;
+                                selected: root.fan-mode == i;
+                                clicked => { root.fan-mode-picked(i); }
+                            }
+                            // Same row, so it never pushes the panel (or a curve being dragged) down.
+                            if root.fan-mode == 5: Chip {
+                                text: "Custom";
+                                selected: true;
+                                clickable: false;
+                            }
+                        }
+                        // Fixed height: switching modes never moves anything below.
+                        Rectangle {
+                            height: 52px;
+                            VerticalLayout {
+                                alignment: start;
+                                spacing: 2px;
+                                Hint { text: root.mode-hints[root.fan-mode]; }
+                                if root.fan-mode >= 1 && root.fan-mode <= 3: Hint {
+                                    text: "Keep NitroRust running for this mode. The tray is fine.";
+                                }
+                            }
+                        }
+                        if root.advanced: VerticalLayout {
+                            spacing: Theme.gap;
+                            padding-top: 8px;
+                            Heading { text: "Fixed fan speed"; }
+                            Hint { text: "Moving a slider holds the fans at that speed."; }
+                            HorizontalLayout {
+                                spacing: Theme.gap;
+                                Text { text: "CPU fan"; color: Palette.foreground; vertical-alignment: center; min-width: 64px; }
+                                Slider {
+                                    minimum: 10; maximum: 100; step: 1;
+                                    value <=> root.cpu-fixed;
+                                    changed => { root.fixed-changed(root.cpu-fixed.round(), root.gpu-fixed.round()); }
+                                }
+                                Text { text: root.cpu-fixed.round() + "%"; color: Theme.muted; vertical-alignment: center; min-width: 40px; horizontal-alignment: right; }
+                            }
+                            HorizontalLayout {
+                                spacing: Theme.gap;
+                                Text { text: "GPU fan"; color: Palette.foreground; vertical-alignment: center; min-width: 64px; }
+                                Slider {
+                                    minimum: 10; maximum: 100; step: 1;
+                                    value <=> root.gpu-fixed;
+                                    changed => { root.fixed-changed(root.cpu-fixed.round(), root.gpu-fixed.round()); }
+                                }
+                                Text { text: root.gpu-fixed.round() + "%"; color: Theme.muted; vertical-alignment: center; min-width: 40px; horizontal-alignment: right; }
+                            }
+                        }
+                        Rectangle { height: 1px; background: Palette.border; }
+                        Heading { text: "Power plan"; }
+                        ComboBox {
+                            model: root.power-plans;
+                            current-index <=> root.power-index;
+                            selected => { root.power-picked(self.current-index); }
+                        }
+                    }
+                }
+
+                // Keyboard lighting
+                Panel {
+                    min-width: 330px;
+                    horizontal-stretch: 1;
+                    VerticalLayout {
+                        padding: 14px;
+                        spacing: Theme.gap;
+                        alignment: start;
+                        HorizontalLayout {
+                            Heading { text: "Keyboard lighting"; vertical-alignment: center; }
+                            Rectangle { horizontal-stretch: 1; }
+                            Switch {
+                                text: root.kb-on ? "On" : "Off";
+                                checked <=> root.kb-on;
+                                toggled => { root.kb-on-toggled(self.checked); }
+                            }
+                        }
+                        if root.kb-on: VerticalLayout {
+                            spacing: Theme.gap;
+                            SwatchRow {
+                                swatches: root.swatches;
+                                current: root.kb-color;
+                                show-current: root.kb-color-known;
+                                picked(c) => { root.color-picked(c); }
+                                more => { root.more-colors(); }
+                            }
+                            if root.effect-label != "": Hint { text: root.effect-label + ". Pick a colour to go back to one steady colour."; }
+                            HorizontalLayout {
+                                spacing: Theme.gap;
+                                Text { text: "Brightness"; color: Palette.foreground; vertical-alignment: center; min-width: 72px; }
+                                Slider {
+                                    minimum: 0;
+                                    maximum: 100;
+                                    step: 1;
+                                    value <=> root.kb-brightness;
+                                    changed(v) => { root.brightness-changed(v.round()); }
+                                }
+                                Text { text: root.kb-brightness.round() + "%"; color: Theme.muted; vertical-alignment: center; min-width: 40px; horizontal-alignment: right; }
+                            }
+                            if root.advanced: VerticalLayout {
+                                spacing: Theme.gap;
+                                padding-top: 8px;
+                                Heading { text: "Effect"; }
+                                ComboBox {
+                                    model: root.effects;
+                                    current-index <=> root.effect-index;
+                                    selected => { root.effect-picked(self.current-index); }
+                                }
+                                HorizontalLayout {
+                                    spacing: Theme.gap;
+                                    Text { text: "Speed"; color: Palette.foreground; vertical-alignment: center; min-width: 72px; }
+                                    Slider {
+                                        minimum: 1; maximum: 9; step: 1;
+                                        value <=> root.kb-speed;
+                                        changed(v) => { root.kb-speed-changed(v.round()); }
+                                    }
+                                    Text { text: root.kb-speed.round(); color: Theme.muted; vertical-alignment: center; min-width: 40px; horizontal-alignment: right; }
+                                }
+                                CheckBox {
+                                    text: "Right to left";
+                                    checked <=> root.kb-left;
+                                    toggled => { root.kb-left-toggled(self.checked); }
+                                }
+                                Heading { text: "Zone colours"; }
+                                HorizontalLayout {
+                                    spacing: 6px;
+                                    for z[i] in root.zones: Chip {
+                                        text: "     " + (i + 1);
+                                        selected: root.zone-editing == i;
+                                        clicked => { root.zone-editing = root.zone-editing == i ? -1 : i; }
+                                        Rectangle {
+                                            x: 12px;
+                                            y: (parent.height - self.height) / 2;
+                                            width: 12px;
+                                            height: 12px;
+                                            border-radius: 6px;
+                                            background: z;
+                                            border-width: 1px;
+                                            border-color: Palette.border;
+                                        }
+                                    }
+                                }
+                                if root.zone-editing >= 0: SwatchRow {
+                                    swatches: root.swatches;
+                                    current: root.zones[root.zone-editing];
+                                    show-current: true;
+                                    picked(c) => { root.zone-picked(root.zone-editing, c); }
+                                    more => { root.zone-more(root.zone-editing); }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Advanced: the curve editor gets the full width.
+            if root.advanced: Panel {
+                VerticalLayout {
+                    padding: 14px;
+                    spacing: Theme.gap;
+                    HorizontalLayout {
+                        spacing: 16px;
+                        Heading { text: "Fan curve"; vertical-alignment: center; }
+                        Hint { text: root.curve-caption; vertical-alignment: center; horizontal-stretch: 1; }
+                        CheckBox {
+                            text: "Separate GPU curve";
+                            checked <=> root.separate-gpu;
+                            toggled => { root.separate-toggled(self.checked); }
+                        }
+                        if root.separate-gpu: HorizontalLayout {
+                            spacing: 4px;
+                            Chip { text: "CPU"; width: 56px; selected: root.curve-target == 0; clicked => { root.curve-target-picked(0); } }
+                            Chip { text: "GPU"; width: 56px; selected: root.curve-target == 1; clicked => { root.curve-target-picked(1); } }
+                        }
+                    }
+                    CurveGraph {
+                        points: root.points;
+                        path-commands: root.path-commands;
+                        live-temp: root.curve-target == 1 ? root.gpu-temp : root.cpu-temp;
+                        dragged(i, t, p) => { root.point-dragged(i, t, p); }
+                        drag-ended => { root.drag-ended(); }
+                    }
+                    HorizontalLayout {
+                        Hint { text: "30 °C"; }
+                        Rectangle { horizontal-stretch: 1; }
+                        Hint { text: "Always 100% from 90 °C"; }
+                        Rectangle { horizontal-stretch: 1; }
+                        Hint { text: "100 °C"; }
+                    }
+                    HorizontalLayout {
+                        spacing: Theme.gap;
+                        LineEdit {
+                            horizontal-stretch: 1;
+                            text <=> root.curve-text;
+                            placeholder-text: "e.g. 55:20 65:30 75:50 85:80";
+                            accepted(t) => { root.curve-text-entered(t); }
+                            changed has-focus => {
+                                if !self.has-focus { root.curve-text-entered(self.text); }
+                            }
+                        }
+                        Hint {
+                            width: 320px;
+                            vertical-alignment: center;
+                            text: root.curve-error != "" ? root.curve-error : "Pairs of temperature:speed%. Press Enter to apply.";
+                            color: root.curve-error != "" ? Theme.hot : Theme.muted;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Lives in the notification area. The ✓ marks the current fan mode.
+export component Tray inherits SystemTrayIcon {
+    icon: @image-url("icon.png");
+    tooltip: "NitroRust";
+    in property <int> fan-mode;
+    callback action(string);
+    clicked => { root.action("open"); }
+    Menu {
+        MenuItem { title: "Open NitroRust"; activated => { root.action("open"); } }
+        MenuSeparator {}
+        MenuItem { title: (root.fan-mode == 0 ? "✓ " : "    ") + "Auto"; activated => { root.action("mode0"); } }
+        MenuItem { title: (root.fan-mode == 1 ? "✓ " : "    ") + "Quiet"; activated => { root.action("mode1"); } }
+        MenuItem { title: (root.fan-mode == 2 ? "✓ " : "    ") + "Balanced"; activated => { root.action("mode2"); } }
+        MenuItem { title: (root.fan-mode == 3 ? "✓ " : "    ") + "Cool"; activated => { root.action("mode3"); } }
+        MenuItem { title: (root.fan-mode == 4 ? "✓ " : "    ") + "Max"; activated => { root.action("mode4"); } }
+        MenuSeparator {}
+        MenuItem { title: "Exit"; activated => { root.action("exit"); } }
+    }
+}

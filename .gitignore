@@ -1,0 +1,6 @@
+# Rust build output
+rs/target/
+# Installer build output
+installer/Output/
+# Acer's own NitroSense files (proprietary, not ours to redistribute)
+app/
