@@ -278,7 +278,8 @@ component Panel inherits Rectangle {
 export component AppWindow inherits Window {
     title: "NitroRust";
     icon: @image-url("icon.png");
-    min-width: 940px;
+    // The narrow (two-column) layout needs about 600px; below 960px it is used.
+    min-width: 600px;
     min-height: 320px;
     preferred-width: 980px;
     preferred-height: 560px;

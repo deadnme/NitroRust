@@ -55,8 +55,18 @@ const TASK: &str = "NitroRust";
 const OLD_TASK: &str = "NitroSense-rs";
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
+/// Full path to System32\schtasks.exe. A bare "schtasks" would also be looked up in the
+/// exe's own folder first, and this process runs elevated.
+fn schtasks_exe() -> std::path::PathBuf {
+    use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
+    let mut buf = [0u16; 260];
+    let n = unsafe { GetSystemDirectoryW(buf.as_mut_ptr(), buf.len() as u32) } as usize;
+    let dir = if n > 0 && n < buf.len() { String::from_utf16_lossy(&buf[..n]) } else { r"C:\Windows\System32".into() };
+    std::path::Path::new(&dir).join("schtasks.exe")
+}
+
 fn schtasks(args: &[&str]) -> bool {
-    Command::new("schtasks")
+    Command::new(schtasks_exe())
         .args(args)
         .creation_flags(CREATE_NO_WINDOW)
         .output()

@@ -140,7 +140,7 @@ and hides what isn't there.
 - Fixed fan speed (Advanced sliders) has no 90 °C safety rule. Use a curve if you want one.
 - If Windows Explorer restarts, the tray icon does not come back until you open NitroRust again.
 - If the laptop's fan controls stop responding, the window can freeze until they answer.
-- If a temperature sensor read fails, the tile can show 0 °C for a moment.
+- If a temperature sensor read fails, the tile shows "--" for a moment. A GPU fan on a curve then follows the CPU temperature, so the 90 °C failsafe still applies.
 
 ## Build from source
 

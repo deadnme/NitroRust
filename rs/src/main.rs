@@ -437,7 +437,7 @@ impl App {
         if !self.fitted.replace(true) {
             // Size to content on the first showing, once Windows has placed the window.
             let b = self.clone();
-            Timer::single_shot(Duration::from_millis(150), move || b.fit_window());
+            Timer::single_shot(Duration::from_millis(150), move || b.fit_window(true));
         }
         self.st.borrow_mut().visible = true;
         use slint::winit_030::WinitWindowAccessor;
@@ -455,22 +455,30 @@ impl App {
 
     /// Sizes the window to its content, up to the screen's work area, and moves it up
     /// if it would run past the taskbar. The content scrolls when the screen is too short.
-    fn fit_window(&self) {
+    /// `widen` (first showing only): make room for the three columns. Later refits keep the
+    /// user's width, so a window snapped narrow stays narrow.
+    fn fit_window(&self, widen: bool) {
+        use slint::winit_030::WinitWindowAccessor;
         let w = self.ui.window();
+        if w.is_maximized() {
+            return; // resizing would un-maximize it
+        }
         let scale = w.scale_factor();
         let pos = w.position();
         let (left, top, right, bottom) = work_area(pos.x + 50, pos.y + 50);
-        // Wide enough for the three columns, but never wider than the screen (a portrait
-        // monitor gets the narrow two-column layout instead).
-        let width = w.size().to_logical(scale).width.max(980.0).min((right - left) as f32 / scale);
+        // Invisible resize borders: position() is the outer top-left, size() the client area.
+        let frame = w.with_winit_window(|ww| ww.outer_size().width.saturating_sub(ww.inner_size().width) as i32).unwrap_or(0);
+        let current = w.size().to_logical(scale).width;
+        // Never wider than the screen: a portrait monitor gets the two-column layout instead.
+        let width = if widen { current.max(980.0) } else { current }.min((right - left - frame) as f32 / scale);
         let title_bar = 40.0;
         let room = (bottom - top) as f32 / scale - title_bar;
         let height = self.ui.get_content_height().min(room).max(320.0);
         w.set_size(slint::LogicalSize::new(width, height));
         // position() is the outer top-left (title bar included).
         let needed = ((height + title_bar) * scale) as i32;
-        let y = if pos.y + needed > bottom { (bottom - needed).max(top) } else { pos.y };
-        let x = pos.x.min(right - (width * scale) as i32).max(left);
+        let y = pos.y.min(bottom - needed).max(top);
+        let x = pos.x.min(right - (width * scale) as i32 - frame).max(left);
         if (x, y) != (pos.x, pos.y) {
             w.set_position(slint::PhysicalPosition::new(x, y));
         }
@@ -496,7 +504,7 @@ impl App {
     fn tray_action(self: &Rc<Self>, id: &str) {
         match id {
             "open" => self.show(),
-            "refit" => self.fit_window(),
+            "refit" => self.fit_window(false),
             "exit" => self.exit(),
             "curve-refused" => self.curve_refused(),
             "telemetry" => self.update_tray_tooltip(),
@@ -1011,15 +1019,23 @@ impl App {
 
 /// One curve step: returns the speeds now in force (0 = retry next tick).
 /// None = the firmware refused the speeds (it is already back on Auto).
+/// Target speeds (CPU, GPU) for these readings. The GPU reads 0 °C when the dGPU sleeps, when
+/// a read fails, or on a model with no GPU sensor: its fan then follows the CPU temperature,
+/// so the 90 °C failsafe still applies (shared heat pipes) instead of the curve's lowest point.
+fn curve_targets(t: acer::Telemetry, cc: &Curve, gc: &Curve) -> (u8, u8) {
+    let gpu_temp = if t.gpu_temp > 0 { t.gpu_temp } else { t.cpu_temp };
+    (cc.percent(t.cpu_temp), gc.percent(gpu_temp))
+}
+
 fn run_curve(a: &acer::Acer, t: acer::Telemetry, cc: &Curve, gc: &Curve, (cur_cpu, cur_gpu): (u8, u8)) -> Option<(u8, u8)> {
     if t.cpu_temp == 0 {
         // The CPU sensor read failed: hand control back rather than guess.
         let _ = a.fans_auto();
         return Some((0, 0));
     }
-    // A sleeping dGPU reads 0 °C: its fan then follows the curve's lowest point.
-    let cpu = curve::next_speed(cur_cpu, cc.percent(t.cpu_temp));
-    let gpu = curve::next_speed(cur_gpu, gc.percent(t.gpu_temp));
+    let (cpu_target, gpu_target) = curve_targets(t, cc, gc);
+    let cpu = curve::next_speed(cur_cpu, cpu_target);
+    let gpu = curve::next_speed(cur_gpu, gpu_target);
     if cpu.is_none() && gpu.is_none() {
         return Some((cur_cpu, cur_gpu));
     }
@@ -1385,7 +1401,7 @@ impl App {
             a.remember(&[("advanced", (on as u8).to_string())]);
             // Resize once the new section has been laid out.
             let b = a.clone();
-            Timer::single_shot(Duration::ZERO, move || b.fit_window());
+            Timer::single_shot(Duration::ZERO, move || b.fit_window(false));
         });
         on!(on_dismiss_error, |a| a.clear_error());
         on!(on_fixed_changed, |a, c, g| a.fixed_changed(c, g));
@@ -1488,6 +1504,17 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gpu_fan_keeps_failsafe_without_gpu_reading() {
+        let c = Curve::parse("50:20 60:35 70:55 80:80 90:100").unwrap();
+        let t = |cpu, gpu| acer::Telemetry { cpu_temp: cpu, gpu_temp: gpu, ..Default::default() };
+        // No GPU reading at 92 °C CPU: the GPU fan follows the CPU into the failsafe.
+        assert_eq!(curve_targets(t(92, 0), &c, &c), (100, 100));
+        // A real GPU reading still drives the GPU fan.
+        assert_eq!(curve_targets(t(92, 50), &c, &c), (100, 20));
+        assert_eq!(curve_targets(t(50, 95), &c, &c), (20, 100));
+    }
 
     fn settings(pairs: &[(&str, &str)]) -> Settings {
         let mut s = Settings::default();
