@@ -387,6 +387,8 @@ export component AppWindow inherits Window {
         "Using your own settings from Advanced. Pick a mode to switch back.",
     ];
     property <int> zone-editing: -1;
+    // Too narrow for three columns (e.g. snapped on a portrait monitor): keyboard goes under the fans.
+    property <bool> narrow: self.width < 960px;
 
     ScrollView {
         content-width: max(self.visible-width, content.min-width);
@@ -489,11 +491,14 @@ export component AppWindow inherits Window {
             }
 
             // Three columns, like Acer's NitroSense: temperatures, fans + power, keyboard.
-            HorizontalLayout {
+            // When narrow, two columns with the keyboard panel full width below.
+            GridLayout {
                 spacing: 16px;
 
                 // Temperatures
                 VerticalLayout {
+                    row: 0;
+                    col: 0;
                     width: 210px;
                     spacing: Theme.gap;
                     alignment: start;
@@ -503,6 +508,8 @@ export component AppWindow inherits Window {
 
                 // Fans and power plan. Equal preferred widths: long wrapped hints can't squeeze the keyboard panel.
                 Panel {
+                    row: 0;
+                    col: 1;
                     min-width: 340px;
                     preferred-width: 400px;
                     horizontal-stretch: 1;
@@ -605,6 +612,9 @@ export component AppWindow inherits Window {
 
                 // Keyboard lighting
                 Panel {
+                    row: root.narrow ? 1 : 0;
+                    col: root.narrow ? 0 : 2;
+                    colspan: root.narrow ? 2 : 1;
                     min-width: 330px;
                     preferred-width: 400px;
                     horizontal-stretch: 1;

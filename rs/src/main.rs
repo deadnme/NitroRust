@@ -459,17 +459,20 @@ impl App {
         let w = self.ui.window();
         let scale = w.scale_factor();
         let pos = w.position();
-        let (top, bottom) = work_area(pos.x + 50, pos.y + 50);
-        let width = w.size().to_logical(scale).width.max(980.0);
+        let (left, top, right, bottom) = work_area(pos.x + 50, pos.y + 50);
+        // Wide enough for the three columns, but never wider than the screen (a portrait
+        // monitor gets the narrow two-column layout instead).
+        let width = w.size().to_logical(scale).width.max(980.0).min((right - left) as f32 / scale);
         let title_bar = 40.0;
         let room = (bottom - top) as f32 / scale - title_bar;
         let height = self.ui.get_content_height().min(room).max(320.0);
         w.set_size(slint::LogicalSize::new(width, height));
         // position() is the outer top-left (title bar included).
         let needed = ((height + title_bar) * scale) as i32;
-        if pos.y + needed > bottom {
-            let y = (bottom - needed).max(top);
-            w.set_position(slint::PhysicalPosition::new(pos.x, y));
+        let y = if pos.y + needed > bottom { (bottom - needed).max(top) } else { pos.y };
+        let x = pos.x.min(right - (width * scale) as i32).max(left);
+        if (x, y) != (pos.x, pos.y) {
+            w.set_position(slint::PhysicalPosition::new(x, y));
         }
     }
 
@@ -1038,14 +1041,15 @@ fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-/// Top and bottom of the work area (screen without the taskbar) of the monitor at x, y, in physical pixels.
-fn work_area(x: i32, y: i32) -> (i32, i32) {
+/// Left, top, right and bottom of the work area (screen without the taskbar) of the monitor at x, y, in physical pixels.
+fn work_area(x: i32, y: i32) -> (i32, i32, i32, i32) {
     use windows_sys::Win32::Foundation::POINT;
     use windows_sys::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST};
     let mut mi: MONITORINFO = unsafe { std::mem::zeroed() };
     mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
     let ok = unsafe { GetMonitorInfoW(MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONEAREST), &mut mi) };
-    if ok != 0 { (mi.rcWork.top, mi.rcWork.bottom) } else { (0, 1000) }
+    let r = mi.rcWork;
+    if ok != 0 { (r.left, r.top, r.right, r.bottom) } else { (0, 0, 1600, 1000) }
 }
 
 /// The Windows accent colour (DWM stores it as 0xAABBGGRR).
