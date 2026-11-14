@@ -122,14 +122,16 @@ enum Msg {
     Curve(Option<(Curve, Curve)>),
 }
 
-/// How often the curve reads the temperatures and adjusts the fans.
-const CURVE_PERIOD: Duration = Duration::from_secs(2);
+/// How often the hardware thread reads the sensors (for the window and tray) and runs the curve.
+const POLL_PERIOD: Duration = Duration::from_secs(2);
 
 /// The Acer WMI connection, on a thread of its own, which also runs the fan curve.
 /// - winit turns the UI thread into a COM single-threaded apartment once its event loop starts
 ///   (OLE drag and drop), and WMI objects made before that fail with RPC_E_WRONG_THREAD.
 /// - The curve (and its 90 °C failsafe) must not stop while the UI thread is busy, e.g. inside
 ///   the modal colour dialog, which holds up every Slint timer until it closes.
+/// - The sensors are read here every POLL_PERIOD whatever the window does (hidden, minimized,
+///   in the tray), so the readings shown are never stale and the UI thread never waits on WMI.
 /// Messages run in order, so "stop the curve" then "fans auto" can never be undone by a curve step.
 struct Hw(std::sync::mpsc::Sender<Msg>);
 
@@ -149,7 +151,17 @@ impl Hw {
             let caps = Caps::from_probe(&model, &probe, pretend_unverified);
             a.caps = Some(caps.clone());
             let _ = ready_tx.send(Ok((a.zone_colors(), caps, probe)));
-            hw_loop(&a, rx, move || {
+            let ui2 = ui.clone();
+            let on_telemetry = move |t: acer::Telemetry| {
+                let _ = ui2.upgrade_in_event_loop(move |ui| {
+                    ui.set_cpu_temp(t.cpu_temp as i32);
+                    ui.set_gpu_temp(t.gpu_temp as i32);
+                    ui.set_cpu_rpm(t.cpu_rpm as i32);
+                    ui.set_gpu_rpm(t.gpu_rpm as i32);
+                    ui.invoke_tray_action("telemetry".into());
+                });
+            };
+            hw_loop(&a, rx, on_telemetry, move || {
                 let _ = ui.upgrade_in_event_loop(|ui| ui.invoke_tray_action("curve-refused".into()));
             });
         });
@@ -176,7 +188,7 @@ impl Hw {
 /// Refused curve writes in a row before the curve is stopped and the fans handed back to Auto.
 const CURVE_REFUSALS: u32 = 2;
 
-fn hw_loop(a: &acer::Acer, rx: std::sync::mpsc::Receiver<Msg>, on_refused: impl Fn()) {
+fn hw_loop(a: &acer::Acer, rx: std::sync::mpsc::Receiver<Msg>, on_telemetry: impl Fn(acer::Telemetry), on_refused: impl Fn()) {
     use std::sync::mpsc::RecvTimeoutError;
     use std::time::Instant;
     let mut curve: Option<(Curve, Curve)> = None;
@@ -185,12 +197,7 @@ fn hw_loop(a: &acer::Acer, rx: std::sync::mpsc::Receiver<Msg>, on_refused: impl 
     let mut next = Instant::now();
     let mut refusals = 0;
     loop {
-        let msg = if curve.is_some() {
-            rx.recv_timeout(next.saturating_duration_since(Instant::now()))
-        } else {
-            rx.recv().map_err(|_| RecvTimeoutError::Disconnected)
-        };
-        match msg {
+        match rx.recv_timeout(next.saturating_duration_since(Instant::now())) {
             Ok(Msg::Job(job)) => job(a),
             Ok(Msg::Curve(c)) => {
                 curve = c;
@@ -201,23 +208,26 @@ fn hw_loop(a: &acer::Acer, rx: std::sync::mpsc::Receiver<Msg>, on_refused: impl 
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => return,
         }
+        if Instant::now() < next {
+            continue;
+        }
+        next = Instant::now() + POLL_PERIOD;
+        let t = a.telemetry();
+        on_telemetry(t);
         if let Some((cc, gc)) = curve.as_ref() {
-            if Instant::now() >= next {
-                next = Instant::now() + CURVE_PERIOD;
-                match run_curve(a, a.temps(), cc, gc, sent) {
-                    Some(s) => {
-                        sent = s;
-                        refusals = 0;
-                    }
-                    None => {
-                        // The firmware said no (not a WMI hiccup): stop rather than retry forever.
-                        sent = (0, 0);
-                        refusals += 1;
-                        if refusals >= CURVE_REFUSALS {
-                            curve = None;
-                            let _ = a.fans_auto();
-                            on_refused();
-                        }
+            match run_curve(a, t, cc, gc, sent) {
+                Some(s) => {
+                    sent = s;
+                    refusals = 0;
+                }
+                None => {
+                    // The firmware said no (not a WMI hiccup): stop rather than retry forever.
+                    sent = (0, 0);
+                    refusals += 1;
+                    if refusals >= CURVE_REFUSALS {
+                        curve = None;
+                        let _ = a.fans_auto();
+                        on_refused();
                     }
                 }
             }
@@ -335,7 +345,6 @@ struct App {
     ui: AppWindow,
     tray: Tray,
     st: RefCell<State>,
-    tick_timer: Timer,
     fan_timer: Timer,
     kb_timer: Timer,
     /// The graph's points. Updated row by row, never replaced: a new model would recreate
@@ -437,16 +446,11 @@ impl App {
             w.focus_window();
         });
         self.load_plans();
-        self.tick();
     }
 
     fn hidden(&self) {
         self.st.borrow_mut().visible = false;
         trim_memory();
-    }
-
-    fn on_screen(&self) -> bool {
-        self.st.borrow().visible && !self.ui.window().is_minimized()
     }
 
     /// Sizes the window to its content, up to the screen's work area, and moves it up
@@ -472,7 +476,6 @@ impl App {
     /// Hands the fans back to the firmware: with the app gone, nothing could undo a
     /// fixed speed or Max, or keep a curve running. The saved mode comes back next start.
     fn exit(&self) {
-        self.tick_timer.stop();
         self.fan_timer.stop();
         self.kb_timer.stop();
         let st = self.st.borrow();
@@ -493,6 +496,7 @@ impl App {
             "refit" => self.fit_window(),
             "exit" => self.exit(),
             "curve-refused" => self.curve_refused(),
+            "telemetry" => self.update_tray_tooltip(),
             m if m.starts_with("mode") => {
                 let fan = Fan::from_chip(m[4..].parse().unwrap_or(0));
                 if !self.fan_allowed(fan) {
@@ -504,22 +508,26 @@ impl App {
         }
     }
 
-    // ---- telemetry and the curve loop ----
+    // ---- telemetry ----
 
-    /// Reads the sensors for the window, only while it is on screen. The curve runs on the
-    /// hardware thread (hw_loop) whatever the window does.
-    fn tick(&self) {
-        // During the fan test the hardware thread is busy for ~12 s: waiting here would freeze the window.
-        if !self.on_screen() || self.st.borrow().fan_testing {
-            return;
-        }
-        let st = self.st.borrow();
-        let Some(t) = st.hw.as_ref().and_then(|h| h.run(|a| a.telemetry())) else { return };
-        drop(st);
-        self.ui.set_cpu_temp(t.cpu_temp as i32);
-        self.ui.set_gpu_temp(t.gpu_temp as i32);
-        self.ui.set_cpu_rpm(t.cpu_rpm as i32);
-        self.ui.set_gpu_rpm(t.gpu_rpm as i32);
+    /// The hardware thread has just put fresh readings in the window; mirror them in the tray tooltip.
+    fn update_tray_tooltip(&self) {
+        let ui = &self.ui;
+        let caps = self.st.borrow().caps.clone();
+        let Some(c) = caps else { return };
+        // Same as the window's tiles: 0 means no reading (e.g. a sleeping dGPU), not 0 °C.
+        let temp = |v: i32| if v > 0 { format!("{v} °C") } else { "--".into() };
+        let parts: Vec<String> = [
+            (c.cpu_temp, format!("CPU {}", temp(ui.get_cpu_temp()))),
+            (c.gpu_temp, format!("GPU {}", temp(ui.get_gpu_temp()))),
+            (c.cpu_rpm, format!("CPU fan {} rpm", ui.get_cpu_rpm())),
+            (c.gpu_rpm, format!("GPU fan {} rpm", ui.get_gpu_rpm())),
+        ]
+        .into_iter()
+        .filter_map(|(has, s)| has.then_some(s))
+        .collect();
+        let status = if parts.is_empty() { "NitroRust".to_string() } else { format!("NitroRust\n{}", parts.join("\n")) };
+        self.tray.set_status(status.into());
     }
 
     // ---- fans ----
@@ -736,9 +744,6 @@ impl App {
             st.settings.save();
         }
         self.refresh_fan();
-        if ok {
-            self.tick();
-        }
     }
 
     /// The hardware thread stopped a curve the firmware kept refusing; the fans are already on Auto.
@@ -1284,7 +1289,7 @@ fn build(ui: AppWindow, tray: Tray) -> Rc<App> {
     };
     let points = Rc::new(VecModel::default());
     ui.set_points(ModelRc::from(points.clone()));
-    Rc::new(App { ui, tray, st: RefCell::new(st), tick_timer: Timer::default(), fan_timer: Timer::default(), kb_timer: Timer::default(), points, fitted: Default::default() })
+    Rc::new(App { ui, tray, st: RefCell::new(st), fan_timer: Timer::default(), kb_timer: Timer::default(), points, fitted: Default::default() })
         .init(fan)
 }
 
@@ -1337,8 +1342,6 @@ impl App {
             self.refresh_kb();
         }
 
-        let app = self.clone();
-        self.tick_timer.start(TimerMode::Repeated, Duration::from_secs(2), move || app.tick());
         self
     }
 

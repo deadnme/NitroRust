@@ -27,7 +27,7 @@ At startup it asks the laptop what it supports and only shows those controls
 - **Keyboard lighting:** on/off, any colour, brightness. Advanced adds effects (wave, breathing and others),
   speed, direction and a colour for each of the 4 zones.
 - **Power plan** picker (the Windows power plans).
-- **Tray icon** with Open, the 5 fan modes and Exit. Closing the window keeps NitroRust in the tray.
+- **Tray icon** with Open, the 5 fan modes and Exit. Hover it to see live temperatures and fan speeds. Closing the window keeps NitroRust in the tray, and the readings keep updating every 2 seconds.
 - **Start with Windows:** starts hidden in the tray at sign-in, with no UAC prompt, and re-applies your settings.
 - Follows the Windows light/dark theme and accent colour. Resizable window.
 
@@ -39,7 +39,7 @@ each app idle for 30 seconds. CPU is the share of all 16 CPU threads.
 | | Acer NitroSense 3.1 | NitroRust |
 |---|---|---|
 | **RAM, window open** | 144–147 MB, plus 24 MB for the Predator Service it needs (about 170 MB) | **28–29 MB** |
-| **RAM, minimised / in the tray** | 140 MB + 24 MB | **2.8 MB** |
+| **RAM, minimised / in the tray** | 140 MB + 24 MB | **5.5 MB** (still reading the sensors every 2 s) |
 | **CPU, window open** | 11.3–12.7 % (about 2 threads busy) | **0.0–0.04 %** |
 | **CPU, minimised / in the tray** | 2.6 % + 0.16 % | **0.14 %** |
 | **GPU** | No GPU activity recorded | No GPU activity recorded (NitroRust draws with the CPU) |

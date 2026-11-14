@@ -127,16 +127,6 @@ impl Acer {
         }
     }
 
-    /// Temperatures only: what the fan curve needs while the window is hidden (2 calls, not 4).
-    pub fn temps(&self) -> Telemetry {
-        let (cpu, gpu) = self.caps.as_ref().map_or((true, true), |c| (c.cpu_temp, c.gpu_temp));
-        Telemetry {
-            cpu_temp: sensor_temp(self.sensor(cpu, SENSOR_CPU_TEMP)),
-            gpu_temp: sensor_temp(self.sensor(gpu, SENSOR_GPU_TEMP)),
-            ..Default::default()
-        }
-    }
-
     pub fn fans_auto(&self) -> R<bool> {
         let (c, g) = self.fans();
         self.set("SetGamingFanBehavior", fan_behavior(c, g, MODE_AUTO))

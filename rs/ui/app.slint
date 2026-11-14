@@ -770,7 +770,8 @@ export component AppWindow inherits Window {
 // Lives in the notification area. The ✓ marks the current fan mode.
 export component Tray inherits SystemTrayIcon {
     icon: @image-url("icon.png");
-    tooltip: "NitroRust";
+    in property <string> status: "NitroRust";
+    tooltip: status;
     in property <int> fan-mode;
     callback action(string);
     clicked => { root.action("open"); }
