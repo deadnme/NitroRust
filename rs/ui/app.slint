@@ -398,6 +398,15 @@ export component AppWindow inherits Window {
     property <int> zone-editing: -1;
     // Too narrow for three columns (e.g. snapped on a portrait monitor): keyboard goes under the fans.
     property <bool> narrow: self.width < 960px;
+    // Flipped when Windows asks for a part of the window to be painted again (see main.rs).
+    in-out property <bool> repaint-all;
+
+    // Covers the window and draws nothing; when its colour flips, Slint redraws everything.
+    Rectangle {
+        width: 100%;
+        height: 100%;
+        background: root.repaint-all ? #00000000 : #ffffff00;
+    }
 
     ScrollView {
         content-width: max(self.visible-width, content.min-width);

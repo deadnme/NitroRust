@@ -439,7 +439,11 @@ impl App {
         if !self.fitted.replace(true) {
             // Size to content on the first showing, once Windows has placed the window.
             let b = self.clone();
-            Timer::single_shot(Duration::from_millis(150), move || b.fit_window(true));
+            // The winit window only exists once the event loop runs, so hook it here too.
+            Timer::single_shot(Duration::from_millis(150), move || {
+                hook_window(&b.ui);
+                b.fit_window(true);
+            });
         }
         self.st.borrow_mut().visible = true;
         use slint::winit_030::WinitWindowAccessor;
@@ -1057,6 +1061,91 @@ fn trim_memory() {
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// Fixes two things Windows does to the window that Slint and winit don't handle:
+///
+/// Size: winit resizes the window correctly when Windows changes its DPI (WM_DPICHANGED),
+/// but right after that Slint resizes it again to a size it worked out at the old scale,
+/// 25 % too big or too small. Each crossing made the window grow (or shrink), so it stayed
+/// mostly on the first monitor and Windows flipped the DPI back. For a moment after a DPI
+/// change, any other size is replaced with the one winit chose before it reaches the
+/// window (WM_WINDOWPOSCHANGING), while the window is still at that DPI and not maximized
+/// or minimized.
+/// (Windows' own suggested size is not used: during a drag it is sometimes wrong.)
+///
+/// Blank areas: Slint only redraws what changed in the UI. A part of the window that was
+/// off screen (or never painted) and then comes into view stayed blank until that part of
+/// the UI changed. When Windows asks for an area to be painted again (WM_PAINT with an
+/// update region), the whole window is redrawn.
+fn hook_window(ui: &AppWindow) {
+    use slint::winit_030::WinitWindowAccessor;
+    UI.set(Some(ui.as_weak()));
+    ui.window().with_winit_window(hold_size_after_dpi_change);
+}
+
+thread_local!(static UI: std::cell::Cell<Option<slint::Weak<AppWindow>>> = const { std::cell::Cell::new(None) });
+
+fn hold_size_after_dpi_change(ww: &slint::winit_030::winit::window::Window) {
+    use slint::winit_030::winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use std::cell::Cell;
+    use std::time::Instant;
+    use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+    use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
+    use windows_sys::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
+    use windows_sys::Win32::Graphics::Gdi::GetUpdateRect;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{IsIconic, IsZoomed, SWP_NOSIZE, WINDOWPOS, WM_DPICHANGED, WM_PAINT, WM_WINDOWPOSCHANGING};
+    // Only the UI thread runs the window procedure.
+    thread_local! {
+        static IN_DPI_CHANGE: Cell<bool> = const { Cell::new(false) };
+        // The size winit chose, for which DPI, and when.
+        static HELD: Cell<Option<(i32, i32, u32, Instant)>> = const { Cell::new(None) };
+    }
+    const HOLD: Duration = Duration::from_millis(500);
+    unsafe extern "system" fn proc(h: HWND, msg: u32, w: WPARAM, l: LPARAM, _: usize, _: usize) -> LRESULT {
+        match msg {
+            WM_DPICHANGED => {
+                HELD.set(None);
+                IN_DPI_CHANGE.set(true);
+                let result = unsafe { DefSubclassProc(h, msg, w, l) };
+                IN_DPI_CHANGE.set(false);
+                result
+            }
+            WM_WINDOWPOSCHANGING => {
+                let pos = unsafe { &mut *(l as *mut WINDOWPOS) };
+                if pos.flags & SWP_NOSIZE == 0 {
+                    let dpi = unsafe { GetDpiForWindow(h) };
+                    if IN_DPI_CHANGE.get() {
+                        HELD.set(Some((pos.cx, pos.cy, dpi, Instant::now())));
+                    } else if let Some((cx, cy, ..)) = HELD.get().filter(|s| s.2 == dpi && s.3.elapsed() < HOLD) {
+                        if (pos.cx, pos.cy) != (cx, cy) && unsafe { IsZoomed(h) == 0 && IsIconic(h) == 0 } {
+                            pos.cx = cx;
+                            pos.cy = cy;
+                        }
+                    }
+                }
+                unsafe { DefSubclassProc(h, msg, w, l) }
+            }
+            // Slint's own redraw requests come with an empty update region.
+            WM_PAINT if unsafe { GetUpdateRect(h, std::ptr::null_mut(), 0) } != 0 => {
+                let _ = slint::invoke_from_event_loop(|| {
+                    let ui = UI.take();
+                    if let Some(app) = ui.as_ref().and_then(|w| w.upgrade()) {
+                        app.set_repaint_all(!app.get_repaint_all());
+                    }
+                    UI.set(ui);
+                });
+                unsafe { DefSubclassProc(h, msg, w, l) }
+            }
+            _ => unsafe { DefSubclassProc(h, msg, w, l) },
+        }
+    }
+    if let Ok(handle) = ww.window_handle() {
+        if let RawWindowHandle::Win32(h) = handle.as_raw() {
+            // Installed once, on the first showing; Slint hides the window without destroying it.
+            unsafe { SetWindowSubclass(h.hwnd.get() as HWND, Some(proc), 1, 0) };
+        }
+    }
 }
 
 /// Left, top, right and bottom of the work area (screen without the taskbar) of the monitor at x, y, in physical pixels.
