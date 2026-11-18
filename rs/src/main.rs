@@ -156,6 +156,8 @@ impl Hw {
                 let _ = ui2.upgrade_in_event_loop(move |ui| {
                     ui.set_cpu_temp(t.cpu_temp as i32);
                     ui.set_gpu_temp(t.gpu_temp as i32);
+                    ui.set_cpu_peak(ui.get_cpu_peak().max(t.cpu_temp as i32));
+                    ui.set_gpu_peak(ui.get_gpu_peak().max(t.gpu_temp as i32));
                     ui.set_cpu_rpm(t.cpu_rpm as i32);
                     ui.set_gpu_rpm(t.gpu_rpm as i32);
                     ui.invoke_tray_action("telemetry".into());
