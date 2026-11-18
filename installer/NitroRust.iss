@@ -2,7 +2,7 @@
 ; (after `cargo build --release` in rs\). Output: installer\Output\NitroRust-Setup-<version>.exe
 
 #define AppName "NitroRust"
-#define AppVersion "1.1.3"
+#define AppVersion "1.1.4"
 #define AppExe "nitrorust.exe"
 
 [Setup]
