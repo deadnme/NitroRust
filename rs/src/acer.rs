@@ -1,7 +1,7 @@
 //! Calls into Acer's AcerGamingFunction WMI class. Needs admin rights.
 
 use crate::proto::*;
-use wmi::{IWbemClassWrapper, Variant, WMIConnection, WMIError};
+use wmi::{IWbemClassWrapper, Variant, WMIConnection};
 
 pub struct Acer {
     wmi: WMIConnection,
@@ -18,7 +18,7 @@ struct Instance {
     __Path: String,
 }
 
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Telemetry {
     pub cpu_temp: u32,
     pub gpu_temp: u32,
@@ -26,51 +26,67 @@ pub struct Telemetry {
     pub gpu_rpm: u32,
 }
 
-type R<T> = Result<T, WMIError>;
+pub type R<T> = Result<T, String>;
 
 impl Acer {
     pub fn open() -> R<Self> {
-        let wmi = WMIConnection::with_namespace_path("ROOT\\WMI")?;
-        let found: Vec<Instance> = wmi.raw_query("SELECT __Path FROM AcerGamingFunction")?;
+        let wmi = WMIConnection::with_namespace_path("ROOT\\WMI").map_err(|e| e.to_string())?;
+        let found: Vec<Instance> = wmi
+            .raw_query("SELECT __Path FROM AcerGamingFunction")
+            .map_err(|e| e.to_string())?;
         let path = found
             .into_iter()
             .next()
-            .ok_or_else(|| WMIError::ResultEmpty)?
+            .ok_or_else(|| "AcerGamingFunction WMI instance not found".to_string())?
             .__Path;
-        let class = wmi.get_object("AcerGamingFunction")?;
+        let class = wmi.get_object("AcerGamingFunction").map_err(|e| e.to_string())?;
         Ok(Self { wmi, path, class, caps: None })
     }
 
     /// Read-only questions about what the firmware supports. Never changes anything.
     pub fn probe(&self) -> crate::caps::Probe {
-        let get = |m: &str, v: u32| self.get(m, v).ok();
+        let get = |m: &str, v: u32| self.get(m, v);
+        let misc_profiles = get("GetGamingMiscSetting", MISC_SUPPORTED_PROFILES);
+        let active_profile = if misc_profiles.as_ref().ok().is_some_and(|&v| !supported_profiles(v).is_empty()) {
+            get("GetGamingMiscSetting", MISC_PLATFORM_PROFILE)
+        } else {
+            Err("no thermal profiles reported".into())
+        };
         crate::caps::Probe {
             sys_info: get("GetGamingSysInfo", 0x0000),
             fan_behavior: get("GetGamingFanBehavior", 0x1),
-            kb_backlight: self.kb_backlight_state().ok(),
+            kb_backlight: self.kb_backlight_state(),
             rgb_zone: get("GetGamingRgbKb", 0x1),
-            misc_profiles: get("GetGamingMiscSetting", 0x0A),
+            misc_profiles,
+            active_profile,
         }
     }
 
     /// GetGamingKBBacklight: (gmReturn, gmOutput bytes). It takes no input.
     fn kb_backlight_state(&self) -> R<(u8, Vec<u8>)> {
-        let out = self.wmi.exec_method(&self.path, "GetGamingKBBacklight", None)?.ok_or(WMIError::ResultEmpty)?;
-        let ret = match out.get_property("gmReturn")? {
+        let out = self
+            .wmi
+            .exec_method(&self.path, "GetGamingKBBacklight", None)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "GetGamingKBBacklight returned no output".to_string())?;
+        let ret = match out.get_property("gmReturn").map_err(|e| e.to_string())? {
             Variant::UI1(v) => v,
             Variant::I4(v) => v as u8,
-            _ => 0xFF,
+            Variant::UI4(v) => v as u8,
+            Variant::UI8(v) => v as u8,
+            other => return Err(format!("unexpected gmReturn variant: {other:?}")),
         };
-        let bytes = match out.get_property("gmOutput")? {
+        let bytes = match out.get_property("gmOutput").map_err(|e| e.to_string())? {
             Variant::Array(a) => a
                 .into_iter()
                 .map(|v| match v {
                     Variant::UI1(b) => b,
                     Variant::I4(b) => b as u8,
+                    Variant::UI4(b) => b as u8,
                     _ => 0,
                 })
                 .collect(),
-            _ => Vec::new(),
+            other => return Err(format!("unexpected gmOutput variant: {other:?}")),
         };
         Ok((ret, bytes))
     }
@@ -81,28 +97,37 @@ impl Acer {
     }
 
     /// Runs one gaming method. `input` goes in as gmInput; gmOutput comes back as a number.
+    /// Never turns None / Null / unexpected variants into 0 (since 0 means success).
     fn call(&self, method: &str, input: Variant) -> R<u64> {
         let params = self
             .class
-            .get_method(method)?
-            .ok_or(WMIError::ResultEmpty)?
-            .spawn_instance()?;
-        params.put_property("gmInput", input)?;
-        let out = self.wmi.exec_method(&self.path, method, Some(&params))?;
-        let value = match out {
-            Some(o) => o.get_property("gmOutput")?,
-            None => return Ok(0),
-        };
-        Ok(match value {
-            Variant::UI8(v) => v,
-            Variant::UI4(v) => v as u64,
-            Variant::I4(v) => v as u32 as u64,
-            Variant::String(s) => s.parse().unwrap_or(0),
-            _ => 0,
-        })
+            .get_method(method)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("{method}: method has no input signature"))?
+            .spawn_instance()
+            .map_err(|e| e.to_string())?;
+        params.put_property("gmInput", input).map_err(|e| e.to_string())?;
+        let out = self
+            .wmi
+            .exec_method(&self.path, method, Some(&params))
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("{method}: returned no output"))?;
+        let value = out.get_property("gmOutput").map_err(|e| e.to_string())?;
+        match value {
+            Variant::UI8(v) => Ok(v),
+            Variant::UI4(v) => Ok(v as u64),
+            Variant::I4(v) => Ok(v as u32 as u64),
+            Variant::UI2(v) => Ok(v as u64),
+            Variant::UI1(v) => Ok(v as u64),
+            Variant::String(s) => s
+                .trim()
+                .parse()
+                .map_err(|_| format!("{method}: non-numeric gmOutput '{s}'")),
+            other => Err(format!("{method}: unexpected gmOutput variant {other:?}")),
+        }
     }
 
-    /// Set* methods answer 0 for success.
+    /// Set* methods answer 0 for success; non-zero means firmware refused.
     fn set(&self, method: &str, input: u64) -> R<bool> {
         Ok(self.call(method, Variant::UI8(input))? == 0)
     }
@@ -114,16 +139,23 @@ impl Acer {
     /// Reads one sensor if this laptop has it; 0 otherwise.
     fn sensor(&self, has: bool, addr: u32) -> u64 {
         // Bits 0-7 are a status: anything but 0 is an error reply, not a reading.
-        if has { self.get("GetGamingSysInfo", addr).ok().filter(|v| v & 0xFF == 0).unwrap_or(0) } else { 0 }
+        if has {
+            self.get("GetGamingSysInfo", addr).ok().filter(|v| v & 0xFF == 0).unwrap_or(0)
+        } else {
+            0
+        }
     }
 
     pub fn telemetry(&self) -> Telemetry {
-        let c = self.caps.clone().unwrap_or_else(|| crate::caps::Caps::from_probe("", &Default::default(), false));
+        let (has_cpu_t, has_gpu_t, has_cpu_r, has_gpu_r) = self
+            .caps
+            .as_ref()
+            .map_or((true, true, true, true), |c| (c.cpu_temp, c.gpu_temp, c.cpu_rpm, c.gpu_rpm));
         Telemetry {
-            cpu_temp: sensor_temp(self.sensor(c.cpu_temp, SENSOR_CPU_TEMP)),
-            gpu_temp: sensor_temp(self.sensor(c.gpu_temp, SENSOR_GPU_TEMP)),
-            cpu_rpm: sensor_rpm(self.sensor(c.cpu_rpm, SENSOR_CPU_RPM)),
-            gpu_rpm: sensor_rpm(self.sensor(c.gpu_rpm, SENSOR_GPU_RPM)),
+            cpu_temp: sensor_temp(self.sensor(has_cpu_t, SENSOR_CPU_TEMP)),
+            gpu_temp: sensor_temp(self.sensor(has_gpu_t, SENSOR_GPU_TEMP)),
+            cpu_rpm: sensor_rpm(self.sensor(has_cpu_r, SENSOR_CPU_RPM)),
+            gpu_rpm: sensor_rpm(self.sensor(has_gpu_r, SENSOR_GPU_RPM)),
         }
     }
 
@@ -142,7 +174,13 @@ impl Acer {
         if !self.set("SetGamingFanBehavior", fan_behavior(has_cpu, has_gpu, MODE_CUSTOM))? {
             return Ok(false);
         }
-        let speed = |has: bool, id, pct| if has { self.set("SetGamingFanSpeed", fan_speed(id, pct)) } else { Ok(true) };
+        let speed = |has: bool, id, pct| {
+            if has {
+                self.set("SetGamingFanSpeed", fan_speed(id, pct))
+            } else {
+                Ok(true)
+            }
+        };
         let speeds = speed(has_cpu, FAN_CPU, cpu).and_then(|a| Ok(a & speed(has_gpu, FAN_GPU, gpu)?));
         if !matches!(speeds, Ok(true)) {
             // Never leave the fans in custom mode at an unknown speed.
@@ -151,12 +189,25 @@ impl Acer {
         speeds
     }
 
-    /// Current zone colours, read from the firmware.
+    /// Reads the active firmware thermal profile ID (0x0B), if supported.
+    pub fn active_thermal_profile(&self) -> R<Option<u8>> {
+        let raw = self.get("GetGamingMiscSetting", MISC_PLATFORM_PROFILE)?;
+        Ok(active_profile(raw))
+    }
+
+    /// Switches the firmware thermal profile (Quiet/Balanced/Performance/Turbo/Eco).
+    pub fn set_thermal_profile(&self, id: u8) -> R<bool> {
+        self.set("SetGamingMiscSetting", set_profile_payload(id))
+    }
+
+    /// Current zone colours, read from the firmware. Ignores error replies (status byte != 0).
     pub fn zone_colors(&self) -> [[u8; 3]; 4] {
         let mut c = [[255, 0, 0]; 4];
         for (z, slot) in c.iter_mut().enumerate() {
             if let Ok(raw) = self.get("GetGamingRgbKb", 1 << z) {
-                *slot = zone_color_from(raw);
+                if raw & 0xFF == 0 {
+                    *slot = zone_color_from(raw);
+                }
             }
         }
         c
@@ -168,9 +219,12 @@ impl Acer {
         Ok(self.call("SetGamingKBBacklight", arr)? == 0)
     }
 
-    /// Static mode with one colour per zone.
+    /// Static mode with one colour per zone. When turning off (brightness == 0), sends a single call.
     pub fn keyboard_zones(&self, brightness: u8, zones: &[[u8; 3]; 4]) -> R<bool> {
         let mut ok = self.keyboard_effect(0, 0, brightness, false, [0; 3])?;
+        if brightness == 0 {
+            return Ok(ok);
+        }
         for (z, rgb) in zones.iter().enumerate() {
             ok &= self.call("SetGamingRgbKb", Variant::UI4(zone_color(z, *rgb)))? == 0;
         }

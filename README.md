@@ -27,7 +27,7 @@ At startup it asks the laptop what it supports and only shows those controls
 - **Keyboard lighting:** on/off, any colour, brightness. Advanced adds effects (wave, breathing and others),
   speed, direction and a colour for each of the 4 zones.
 - **Power plan** picker (the Windows power plans).
-- **Tray icon** with Open, the 5 fan modes and Exit. Hover it to see live temperatures and fan speeds. Closing the window keeps NitroRust in the tray, and the readings keep updating every 2 seconds.
+- **Tray icon** with Open, the fan modes (Auto, Quiet, Balanced, Cool, Max, Custom) and Exit. Hover it to see live temperatures and fan speeds. Closing the window keeps NitroRust in the tray, and the readings keep updating every 2 seconds.
 - **Start with Windows:** starts hidden in the tray at sign-in, with no UAC prompt, and re-applies your settings.
 - Follows the Windows light/dark theme and accent colour. Resizable window.
 
@@ -135,11 +135,8 @@ and hides what isn't there.
 
 ## Known limits
 
-- Only the Nitro AN515-45 is verified so far. Firmware power profiles (Quiet/Balanced/Performance/Turbo
-  on newer models) aren't supported yet; the power plan picker uses Windows power plans.
-- Fixed fan speed (Advanced sliders) has no 90 °C safety rule. Use a curve if you want one.
-- If Windows Explorer restarts, the tray icon does not come back until you open NitroRust again.
-- If the laptop's fan controls stop responding, the window can freeze until they answer.
+- Only the Nitro AN515-45 is verified so far. Models that expose Acer's firmware thermal profiles
+  (`GetGamingMiscSetting 0x0A`) show a **Thermal profile** picker alongside Windows power plans.
 - If a temperature sensor read fails, the tile shows "--" for a moment. A GPU fan on a curve then follows the CPU temperature, so the 90 °C failsafe still applies.
 
 ## Build from source
@@ -149,7 +146,7 @@ Needs [Rust](https://rustup.rs) (stable, MSVC toolchain) and the Visual Studio C
 ```
 cd rs
 cargo build --release
-cargo test --release
+cargo test --lib --release
 ```
 
 The exe is `rs\target\release\nitrorust.exe`. Run it as administrator.
@@ -168,13 +165,17 @@ The installer is written to `installer\Output\`.
 ### Project layout
 
 ```
-rs/src/main.rs       app logic, tray, single instance, fan curve thread
+rs/src/main.rs       CLI flags, single-instance launch, Slint event loop entrypoint
+rs/src/lib.rs        library root (lets `cargo test --lib` run without UAC elevation)
+rs/src/app.rs        UI controller, non-blocking WMI state, tray, sleep/battery policies
+rs/src/hw.rs         dedicated WMI worker thread, curve loop, fixed-mode failsafe, safe fan test
+rs/src/win32.rs      Win32 subclass (DPI, sleep/resume, TaskbarCreated, live accent), IPC, dialogs
 rs/src/acer.rs       AcerGamingFunction WMI calls and the read-only startup probe
 rs/src/caps.rs       what the laptop supports, verified models, diagnostics report
-rs/src/proto.rs      WMI payloads for fans, temperatures and keyboard
-rs/src/curve.rs      fan curves and presets
+rs/src/proto.rs      WMI payloads for fans, sensors, thermal profiles and keyboard
+rs/src/curve.rs      fan curves, spike smoothing and presets
 rs/src/power.rs      Windows power plans
-rs/src/settings.rs   saved settings and the Start with Windows task
+rs/src/settings.rs   atomic settings persistence and hardened Start with Windows task
 rs/ui/app.slint      the UI (Slint, Fluent style)
 installer/           Inno Setup script
 extras/Launcher.cs   resizable window launcher for Acer's own NitroSense (see below)

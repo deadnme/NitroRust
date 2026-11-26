@@ -6,7 +6,7 @@ import { Button, Switch, CheckBox, Slider, ComboBox, ScrollView, LineEdit, Palet
 export struct CurvePoint { t: int, p: int }
 
 export global Theme {
-    // Windows accent colour, read from the registry at start.
+    // Windows accent colour, read from the registry at start and refreshed on DWM changes.
     in property <color> accent: #0078d4;
     out property <color> on-accent: #ffffff;
     out property <color> cool: Palette.color-scheme == ColorScheme.dark ? #5cc98a : #1f7a45;
@@ -137,17 +137,19 @@ component SwatchRow inherits HorizontalLayout {
 
 component TempTile inherits Rectangle {
     in property <string> name;
+    in property <bool> is-gpu;
     in property <int> temp;
     in property <int> peak;
     in property <int> rpm;
     in property <bool> show-rpm;
+    callback reset-peak();
     horizontal-stretch: 1;
     border-radius: Theme.radius;
     background: Palette.alternate-background;
-    property <string> state: temp <= 0 ? "Sleeping" : temp < 60 ? "Cool" : temp <= 80 ? "Warm" : "Hot";
+    property <string> state: temp <= 0 ? (is-gpu ? "Sleeping" : "No reading") : temp < 60 ? "Cool" : temp <= 80 ? "Warm" : "Hot";
     property <color> tone: temp <= 0 ? Theme.muted : temp < 60 ? Theme.cool : temp <= 80 ? Theme.warm : Theme.hot;
     accessible-role: text;
-    accessible-label: name + " " + (temp <= 0 ? "sleeping" : temp + " degrees, " + state);
+    accessible-label: name + " " + (temp <= 0 ? state : temp + " degrees, " + state);
     VerticalLayout {
         padding: 12px;
         spacing: 2px;
@@ -178,10 +180,18 @@ component TempTile inherits Rectangle {
                 }
             }
         }
-        if root.peak > 0: Text {
-            text: "Peak " + root.peak + " °C";
-            font-size: 12px;
-            color: Theme.muted;
+        if root.peak > 0: Rectangle {
+            height: 18px;
+            peak-ta := TouchArea {
+                mouse-cursor: pointer;
+                clicked => { root.reset-peak(); }
+            }
+            Text {
+                text: "Peak " + root.peak + " °C" + (peak-ta.has-hover ? "  (reset)" : "");
+                font-size: 12px;
+                color: peak-ta.has-hover ? Palette.foreground : Theme.muted;
+                vertical-alignment: center;
+            }
         }
         if root.show-rpm: Text {
             text: root.rpm + " rpm";
@@ -244,11 +254,12 @@ component CurveGraph inherits Rectangle {
         stroke-width: 2px;
         fill: transparent;
     }
+    // Handles clamp to the graph range so out-of-range typed points stay inside the box.
     for pt[i] in root.points: Rectangle {
         width: 22px;
         height: 22px;
-        x: (pt.t - 30) / 70 * root.width - 11px;
-        y: (100 - pt.p) / 100 * root.height - 11px;
+        x: clamp((pt.t - 30) / 70, 0, 1) * root.width - 11px;
+        y: clamp((100 - pt.p) / 100, 0, 1) * root.height - 11px;
         Rectangle {
             width: 14px;
             height: 14px;
@@ -298,10 +309,17 @@ export component AppWindow inherits Window {
     in property <int> gpu-peak;
     in property <int> cpu-rpm;
     in property <int> gpu-rpm;
+    callback reset-peaks();
 
     // Fans: 0 Auto, 1 Quiet, 2 Balanced, 3 Cool, 4 Max, 5 Custom (set in Advanced)
     in property <int> fan-mode;
     callback fan-mode-picked(int);
+
+    // Firmware thermal profiles (PredatorSense v4 / newer Nitro models)
+    in property <bool> has-thermal-profiles;
+    in property <[string]> thermal-profiles;
+    in-out property <int> thermal-profile-index: -1;
+    callback thermal-profile-picked(int);
 
     // Power plan
     in property <[string]> power-plans;
@@ -333,10 +351,13 @@ export component AppWindow inherits Window {
     property <bool> show-details;
     callback dismiss-error();
 
-    // Advanced: fixed fan speed
+    // Advanced: fixed fan speed & battery policy
     in-out property <float> cpu-fixed: 50;
     in-out property <float> gpu-fixed: 50;
+    in property <bool> fixed-failsafe-active;
+    in-out property <bool> quiet-on-battery;
     callback fixed-changed(int, int);
+    callback quiet-on-battery-toggled(bool);
 
     // Advanced: curve
     in property <[CurvePoint]> points;
@@ -346,11 +367,13 @@ export component AppWindow inherits Window {
     in property <string> curve-caption;
     in-out property <bool> separate-gpu;
     in-out property <int> curve-target; // 0 CPU, 1 GPU
+    in-out property <bool> curve-smooth: true;
     callback point-dragged(int, int, int);
     callback drag-ended();
     callback curve-text-entered(string);
     callback separate-toggled(bool);
     callback curve-target-picked(int);
+    callback curve-smooth-toggled(bool);
 
     // Advanced: keyboard
     in property <[string]> effects;
@@ -383,7 +406,7 @@ export component AppWindow inherits Window {
     callback copy-diagnostics();
     callback report-model();
 
-    // Tray menu and second-copy launches arrive here.
+    // Tray menu, power events, and second-copy launches arrive here.
     callback tray-action(string);
 
     property <[string]> mode-names: ["Auto", "Quiet", "Balanced", "Cool", "Max"];
@@ -398,7 +421,7 @@ export component AppWindow inherits Window {
     property <int> zone-editing: -1;
     // Too narrow for three columns (e.g. snapped on a portrait monitor): keyboard goes under the fans.
     property <bool> narrow: self.width < 960px;
-    // Flipped when Windows asks for a part of the window to be painted again (see main.rs).
+    // Flipped when Windows asks for a part of the window to be painted again (see win32.rs).
     in-out property <bool> repaint-all;
 
     // Covers the window and draws nothing; when its colour flips, Slint redraws everything.
@@ -520,8 +543,24 @@ export component AppWindow inherits Window {
                     width: 210px;
                     spacing: Theme.gap;
                     alignment: start;
-                    if root.has-cpu-temp: TempTile { name: "Processor (CPU)"; temp: root.cpu-temp; peak: root.cpu-peak; rpm: root.cpu-rpm; show-rpm: root.advanced; }
-                    if root.has-gpu-temp: TempTile { name: "Graphics (GPU)"; temp: root.gpu-temp; peak: root.gpu-peak; rpm: root.gpu-rpm; show-rpm: root.advanced; }
+                    if root.has-cpu-temp: TempTile {
+                        name: "Processor (CPU)";
+                        is-gpu: false;
+                        temp: root.cpu-temp;
+                        peak: root.cpu-peak;
+                        rpm: root.cpu-rpm;
+                        show-rpm: root.advanced;
+                        reset-peak => { root.reset-peaks(); }
+                    }
+                    if root.has-gpu-temp: TempTile {
+                        name: "Graphics (GPU)";
+                        is-gpu: true;
+                        temp: root.gpu-temp;
+                        peak: root.gpu-peak;
+                        rpm: root.gpu-rpm;
+                        show-rpm: root.advanced;
+                        reset-peak => { root.reset-peaks(); }
+                    }
                 }
 
                 // Fans and power plan. Equal preferred widths: long wrapped hints can't squeeze the keyboard panel.
@@ -596,7 +635,11 @@ export component AppWindow inherits Window {
                             padding-top: 8px;
                             if root.fan-test-text != "": Hint { text: root.fan-test-text; min-height: 18px; }
                             Heading { text: "Fixed fan speed"; }
-                            Hint { text: "Moving a slider holds the fans at that speed."; }
+                            Hint { text: "Moving a slider holds the fans at that speed. Fans jump to 100% at 90 °C for safety."; }
+                            if root.fixed-failsafe-active: Hint {
+                                text: "90 °C safety active: fans overridden to 100% until cool.";
+                                color: Theme.hot;
+                            }
                             HorizontalLayout {
                                 spacing: Theme.gap;
                                 Text { text: "CPU fan"; color: Palette.foreground; vertical-alignment: center; min-width: 64px; }
@@ -617,6 +660,18 @@ export component AppWindow inherits Window {
                                 }
                                 Text { text: root.gpu-fixed.round() + "%"; color: Theme.muted; vertical-alignment: center; min-width: 40px; horizontal-alignment: right; }
                             }
+                            if root.has-cpu-temp: CheckBox {
+                                text: "Quiet fans on battery";
+                                checked <=> root.quiet-on-battery;
+                                toggled => { root.quiet-on-battery-toggled(self.checked); }
+                            }
+                        }
+                        if root.has-thermal-profiles: Rectangle { height: 1px; background: Palette.border; }
+                        if root.has-thermal-profiles: Heading { text: "Thermal profile"; }
+                        if root.has-thermal-profiles: ComboBox {
+                            model: root.thermal-profiles;
+                            current-index <=> root.thermal-profile-index;
+                            selected => { root.thermal-profile-picked(self.current-index); }
                         }
                         Rectangle { height: 1px; background: Palette.border; }
                         Heading { text: "Power plan"; }
@@ -729,15 +784,20 @@ export component AppWindow inherits Window {
                 }
             }
 
-            // Advanced: the curve editor gets the full width.
-            if root.advanced && root.has-fan-control && root.fans-unlocked: Panel {
+            // Advanced: the curve editor gets the full width (requires a CPU temp sensor).
+            if root.advanced && root.has-fan-control && root.fans-unlocked && root.has-cpu-temp: Panel {
                 VerticalLayout {
                     padding: 14px;
                     spacing: Theme.gap;
                     HorizontalLayout {
-                        spacing: 16px;
+                        spacing: 12px;
                         Heading { text: "Fan curve"; vertical-alignment: center; }
                         Hint { text: root.curve-caption; vertical-alignment: center; horizontal-stretch: 1; }
+                        CheckBox {
+                            text: "Smooth spikes";
+                            checked <=> root.curve-smooth;
+                            toggled => { root.curve-smooth-toggled(self.checked); }
+                        }
                         if root.has-gpu-fan: CheckBox {
                             text: "Separate GPU curve";
                             checked <=> root.separate-gpu;
@@ -770,9 +830,6 @@ export component AppWindow inherits Window {
                             text <=> root.curve-text;
                             placeholder-text: "e.g. 55:20 65:30 75:50 85:80";
                             accepted(t) => { root.curve-text-entered(t); }
-                            changed has-focus => {
-                                if !self.has-focus { root.curve-text-entered(self.text); }
-                            }
                         }
                         Hint {
                             width: 320px;
@@ -811,6 +868,7 @@ export component Tray inherits SystemTrayIcon {
         MenuItem { title: (root.fan-mode == 2 ? "✓ " : "    ") + "Balanced"; activated => { root.action("mode2"); } }
         MenuItem { title: (root.fan-mode == 3 ? "✓ " : "    ") + "Cool"; activated => { root.action("mode3"); } }
         MenuItem { title: (root.fan-mode == 4 ? "✓ " : "    ") + "Max"; activated => { root.action("mode4"); } }
+        MenuItem { title: (root.fan-mode == 5 ? "✓ " : "    ") + "Custom"; activated => { root.action("mode5"); } }
         MenuSeparator {}
         MenuItem { title: "Exit"; activated => { root.action("exit"); } }
     }

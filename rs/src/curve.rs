@@ -1,7 +1,11 @@
-//! Software fan curve: temperature (°C) to fan percent, linear between points.
+//! Software fan curve: temperature (°C) to fan percent, linear between points,
+//! plus optional short-window spike smoothing so brief Ryzen/Intel boost spikes
+//! don't rev the fans while keeping the 90 °C failsafe instantaneous.
 
-/// At or above this temperature the fan runs at 100% whatever the curve says.
+/// At or above this temperature the fan runs at 100% whatever the curve or fixed speed says.
 pub const FAILSAFE_TEMP: u32 = 90;
+/// Fixed-mode failsafe releases once both sensors drop to or below this temperature.
+pub const FAILSAFE_RELEASE_TEMP: u32 = 85;
 /// Fans only slow down once the target is this many percent below the current speed,
 /// so a temperature hovering on a boundary does not make them hunt.
 pub const HYSTERESIS: u8 = 5;
@@ -32,7 +36,7 @@ impl Curve {
             if t > 110 {
                 return Err(format!("'{pair}': temperature must be 0-110"));
             }
-            if points.last().map_or(false, |&(lt, _)| t <= lt) {
+            if points.last().is_some_and(|&(lt, _)| t <= lt) {
                 return Err("temperatures must rise from left to right".into());
             }
             points.push((t, p));
@@ -79,6 +83,38 @@ pub fn next_speed(current: u8, target: u8) -> Option<u8> {
     }
 }
 
+/// 3-sample (~4-6 s) rolling mean to damp brief CPU boost spikes without delaying the 90 °C failsafe.
+#[derive(Clone, Debug, Default)]
+pub struct TempSmoother {
+    samples: [u32; 3],
+    len: usize,
+    idx: usize,
+}
+
+impl TempSmoother {
+    pub fn reset(&mut self) {
+        self.len = 0;
+        self.idx = 0;
+    }
+
+    pub fn push(&mut self, raw: u32, enabled: bool) -> u32 {
+        if raw == 0 {
+            self.reset();
+            return 0;
+        }
+        self.samples[self.idx] = raw;
+        self.idx = (self.idx + 1) % self.samples.len();
+        if self.len < self.samples.len() {
+            self.len += 1;
+        }
+        if !enabled || raw >= FAILSAFE_TEMP {
+            return raw;
+        }
+        let sum: u32 = self.samples[..self.len].iter().sum();
+        (sum + self.len as u32 / 2) / self.len as u32
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -110,5 +146,25 @@ mod tests {
         assert_eq!(next_speed(50, 47), None);
         assert_eq!(next_speed(50, 45), Some(45));
         assert_eq!(next_speed(50, 50), None);
+    }
+
+    #[test]
+    fn smoother_damps_spikes_but_never_delays_failsafe() {
+        let mut s = TempSmoother::default();
+        assert_eq!(s.push(60, true), 60);
+        assert_eq!(s.push(60, true), 60);
+        // Single 18 C spike is damped to 66 C instead of jumping straight to 78 C.
+        assert_eq!(s.push(78, true), 66);
+        // Back to idle: settles cleanly once the 3-sample window flushes.
+        assert_eq!(s.push(60, true), 66);
+        assert_eq!(s.push(60, true), 66);
+        assert_eq!(s.push(60, true), 60);
+        // Failsafe bypasses smoothing immediately.
+        assert_eq!(s.push(91, true), 91);
+        // Disabled smoothing passes raw through.
+        assert_eq!(s.push(77, false), 77);
+        // Sleeping/failed sensor resets window.
+        assert_eq!(s.push(0, true), 0);
+        assert_eq!(s.push(55, true), 55);
     }
 }
